@@ -12,6 +12,9 @@ Usage (from the workspace root):
     LAYERNORM_TYPE=torch ATTN_IMPL=sdpa \
     LD_LIBRARY_PATH=/mnt/xfs/home/mhg/anaconda3/envs/kineidos-v2-slurm/lib \
       .../envs/kineidos-v2-slurm/bin/python -m kineidos.env_lock runs/<run_id>
+
+An optional second argument is the JSON that kineidos.seeding.set_all_seeds
+returned, which is the only record of what the run's randomness was set to.
 """
 from __future__ import annotations
 
@@ -144,7 +147,7 @@ def collect(workspace: Path) -> dict[str, object]:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         print(__doc__)
         return 2
     out_dir = Path(sys.argv[1])
@@ -152,6 +155,13 @@ def main() -> int:
     workspace = find_workspace_root()
 
     record = collect(workspace)
+    if len(sys.argv) == 3:
+        # The seeds a run was started with.  Recorded because no environment
+        # variable controls them: Protenix's augmentation draws from numpy
+        # (utils/geometry.py's random_transform, every training step and every
+        # sampling step), WorldParticle's initialisers draw from torch, and a
+        # run that logs only one of the two does not pin what it did.
+        record["seeds"] = json.loads(sys.argv[2])
     (out_dir / "env.lock").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 
     print(f"wrote {out_dir / 'env.lock'}")
