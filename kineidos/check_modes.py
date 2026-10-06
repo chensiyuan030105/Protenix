@@ -12,7 +12,12 @@ from kineidos import observables
 from kineidos.data.gagu import GAGUProtenixAdapter
 from kineidos.data.windows import build_window
 from kineidos.seeding import set_all_seeds
-from kineidos.wp_bridge import MODES, TOKEN_DIM, WorldParticleBridge
+from kineidos.wp_bridge import (
+    MODES,
+    TOKEN_DIM,
+    WorldParticleBridge,
+    wp_inputs_from_window,
+)
 
 SAMPLE = Path("/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/"
               "datasets/processed/gagu_internal_loop_v0_1/gagu_100mM_K_agaguu_startI_r1")
@@ -36,11 +41,14 @@ def main() -> int:
           f"anchor RMSD {w.anchor_rmsd_to_ref_nm:.4f} nm")
 
     print("\n=== 2. the three arms the first version runs ===")
+    # The bridge reads tensors out of a mapping, not fields off the Window: in
+    # training it is a submodule of the model and sees only the feature dict.
+    wf = wp_inputs_from_window(w)
     hs = {}
     for mode in ("none", "zero", "random"):
         bridge = WorldParticleBridge(mode, seed=0)
         with torch.no_grad():
-            h = bridge(w)
+            h = bridge(wf)
         hs[mode] = h
         shape = "None" if h is None else tuple(h.shape)
         print(f"  {mode:<10} h = {shape}")
@@ -73,29 +81,29 @@ def main() -> int:
     n_valid = int(early.wp_frame_mask.sum())
     print(f"  a window near the start: mask {early.wp_frame_mask.tolist()}")
     with torch.no_grad():
-        h_early = bridge(early)
+        h_early = bridge(wp_inputs_from_window(early))
     check("a padded window still produces h", tuple(h_early.shape) == (n, TOKEN_DIM),
           f"{n_valid} of 8 frames valid")
     # Padding repeats the oldest real frame, so averaging it in would be
     # averaging a duplicate -- the mask is what stops that.  Compare against a
     # window whose frames are all valid and all distinct.
     with torch.no_grad():
-        h_full = bridge(w)
+        h_full = bridge(wf)
     check("and differs from a fully valid window",
           not torch.allclose(h_early, h_full),
           f"relative difference "
           f"{float((h_early - h_full).norm() / h_full.norm()):.3e}")
 
     print("\n=== 5. the bridge refuses a window transformed after the dataloader ===")
-    drift = bridge.assert_window_canonical(w)
+    drift = bridge.assert_window_canonical(wf)
     check("a clean window passes", drift < 1e-4, f"drift {drift:.3e} nm")
     g = np.random.default_rng(3)
     q, r = np.linalg.qr(g.normal(size=(3, 3)))
     q *= np.sign(np.diag(r))
     if np.linalg.det(q) < 0:
         q[:, 0] *= -1
-    meddled = type(w)(**w.__dict__)
-    meddled.wp_position_nm = torch.from_numpy(
+    meddled = dict(wf)
+    meddled["wp_position_nm"] = torch.from_numpy(
         w.wp_position_nm.double().numpy() @ q.T).float()
     try:
         bridge(meddled)
@@ -105,7 +113,7 @@ def main() -> int:
               str(exc)[:58])
 
     print("\n=== 6. per-frame time is bounded and ordered ===")
-    t = bridge._frame_time_feature(w)
+    t = bridge._frame_time_feature(wf)
     print(f"  {[round(float(x), 3) for x in t.squeeze(-1)]}")
     check("shape is [K, channels]", tuple(t.shape) == (8, 1))
     check("bounded in [-1, 0)", bool((t <= 0).all() and (t >= -1).all()))

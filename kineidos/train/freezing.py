@@ -119,6 +119,19 @@ def freeze_trunk(
         if not any(True for _ in getattr(model, name).parameters())
     )
 
+    # The invariant, stated over parameters rather than over modules.  Three
+    # checks in a row got this wrong by comparing module-name sets against
+    # `trainable_by_module`, which only lists modules that *have* trainable
+    # parameters: a requested module holding none at all -- wp_bridge in the
+    # `zero` and `none` arms, where no WorldParticle network is built -- is
+    # absent from it, and a set comparison reads that as a failure. Parameter
+    # level cannot be fooled either way.
+    allowed = tuple(f"{name}." for name in trainable)
+    escaped = [
+        name for name, param in model.named_parameters()
+        if param.requires_grad and not name.startswith(allowed)
+    ]
+
     total = sum(p.numel() for p in model.parameters())
     total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return {
@@ -126,6 +139,10 @@ def freeze_trunk(
         "parameter_free": parameter_free,
         "frozen_parameters": total - total_trainable,
         "trainable_by_module": by_module,
+        "trainable_requested": tuple(trainable),
+        # Empty means the freeze held. Non-empty names the parameters that got
+        # away, which is the thing worth asserting on.
+        "trainable_outside_request": escaped,
         "trainable_parameters": total_trainable,
         "total_parameters": total,
         "trainable_fraction": total_trainable / total if total else 0.0,
@@ -149,6 +166,10 @@ def format_report(report: dict[str, object]) -> str:
     for name, n in sorted(report["trainable_by_module"].items(),
                           key=lambda kv: -kv[1]):
         lines.append(f"  trainable: {name:<22} {n / 1e6:8.2f}M")
+    if report.get("trainable_outside_request"):
+        names = report["trainable_outside_request"]
+        lines.append(f"  LEAKED: {len(names)} trainable parameters outside "
+                     f"{list(report['trainable_requested'])}: {names[:4]}")
     if report.get("parameter_free"):
         lines.append(
             "  empty (no parameters, so frozen vacuously): "

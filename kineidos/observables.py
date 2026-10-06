@@ -62,25 +62,78 @@ def read(model: torch.nn.Module) -> dict[str, float]:
         return {}
     stats = dict(getattr(enc, "wp_diagnostics", {}) or {})
     if stats:
-        # Recomputed from the weights rather than taken from the forward pass,
-        # so a stale diagnostics dict cannot make the weights look current.
+        # Everything derived from the *weights* is recomputed here and
+        # overwrites whatever the forward pass recorded, so a stale diagnostics
+        # dict cannot make the weights look current.  The forward pass keeps
+        # only what depends on the activations -- the two contribution norms,
+        # the injection strength and |h| after LayerNorm -- which nothing here
+        # can reconstruct.
+        #
+        # Splitting it any other way bit once already: w_cl_drift and the ratio
+        # were recomputed while w_h_norm was left at the forward's value, and an
+        # alarm that reads w_h_norm then silently saw a stale zero.
         with torch.no_grad():
             w = enc.wp_fusion.weight
-            cl = w[:, : enc.c_atom].norm().item()
+            cl_block = w[:, : enc.c_atom]
+            eye = torch.eye(enc.c_atom, device=w.device, dtype=w.dtype)
+            cl = cl_block.norm().item()
             h = w[:, enc.c_atom :].norm().item()
+            drift = (cl_block - eye).norm().item()
+        stats["w_cl_norm"] = cl
+        stats["w_h_norm"] = h
         stats["w_h_over_w_cl"] = h / cl if cl > 0 else float("nan")
+        # The `zero` arm's only instrument.  There h is identically zero, so
+        # dL/dW_h = delta (x) h is zero and W_h cannot move -- correctly, not as
+        # a fault -- which makes every h-side number structurally zero.  What
+        # that arm asks is whether the fusion pathway itself changes the model,
+        # and the one part of it that can move is the c_l block: identity at the
+        # start, with a real gradient of delta (x) c_l.
+        stats["w_cl_drift_from_identity"] = drift
     return stats
 
 
 def warnings(stats: dict[str, float],
-             threshold: float = INJECTION_WARN_BELOW) -> list[str]:
+             threshold: float = INJECTION_WARN_BELOW,
+             mode: str = "random") -> list[str]:
     """Human-readable alarms for a logger to print.
 
     Returned rather than printed so the caller decides the cadence; printing
     this every step would bury it.
+
+    `mode` is the ablation arm, and it changes which alarm means anything.  In
+    `zero` the tokens are identically zero by construction, so the injection
+    strength is zero no matter what the weights do -- warning about it there is
+    noise that trains people to ignore the warning that matters.  What `zero`
+    can still say is whether W_h moved at all, since nothing but a gradient
+    through the fusion can move it.
     """
     out: list[str] = []
     s = stats.get("injection_strength")
+    w_h = stats.get("w_h_norm", 0.0)
+
+    if mode == "zero":
+        # h is identically zero here, so dL/dW_h = delta (x) h is zero and W_h
+        # cannot move.  An alarm about W_h would therefore fire on every step of
+        # every `zero` run and teach people to ignore alarms.  What this arm asks
+        # is whether the fusion pathway itself changes the model, and the one
+        # part of it that can move is the c_l block -- identity at the start,
+        # with a real gradient of delta (x) c_l.
+        drift = stats.get("w_cl_drift_from_identity")
+        if drift is not None and drift == drift and drift == 0.0:
+            out.append(
+                "W_cl is still exactly the identity. In the `zero` arm that is "
+                "the only thing that can move -- h is zero by construction, so "
+                "W_h and the injection strength say nothing -- and no drift "
+                "after training means no gradient reached the fusion at all."
+            )
+        if w_h != 0.0:
+            out.append(
+                f"W_h has left zero ({w_h:.3e}) in the `zero` arm, where its "
+                f"gradient is identically zero. Weight decay can do this; "
+                f"anything larger than that means h was not actually zero."
+            )
+        return out
+
     if s is not None and s == s and s < threshold:          # s == s rejects nan
         out.append(
             f"injection_strength {s:.3e} is below {threshold:.0e}: the "
@@ -89,7 +142,7 @@ def warnings(stats: dict[str, float],
             f"begins at exactly zero; a problem if it persists. v0.1 sat here "
             f"for 5500 steps."
         )
-    if stats.get("w_h_norm", 0.0) > 0 and not s:
+    if w_h > 0 and not s:
         out.append(
             "W_h has left zero but the injection is still ~0, which means the "
             "weights grew without what they multiply mattering -- check "
@@ -119,5 +172,6 @@ def format_line(stats: dict[str, float]) -> str:
         f"wp: inject={f('injection_strength')} "
         f"|W_h|/|W_cl|={f('w_h_over_w_cl')} "
         f"|h_contrib|={f('h_contribution_norm')} "
-        f"|cl_contrib|={f('cl_contribution_norm')}"
+        f"|cl_contrib|={f('cl_contribution_norm')} "
+        f"W_cl-I={f('w_cl_drift_from_identity')}"
     )

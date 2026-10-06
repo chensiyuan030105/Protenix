@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 from collections.abc import Mapping
 
@@ -34,7 +35,13 @@ def build(wp_token_dim=None):
     from protenix.model.protenix import Protenix
 
     name = "protenix_base_default_v1.0.0"
-    base = {**configs_base, **{"data": data_configs}, **inference_configs}
+    # deepcopy, not a shallow {**configs_base}: a shallow copy shares every
+    # nested dict with the module-level default, so writing into
+    # base["model"]["diffusion_module"] below would change the default for any
+    # model built later in this process.  That is how check_trainer's `none` arm
+    # came to be refused for carrying the `zero` arm's wp_token_dim.
+    base = copy.deepcopy(
+        {**configs_base, **{"data": data_configs}, **inference_configs})
 
     def deep_update(d, u):
         for k, v in u.items():
@@ -44,7 +51,7 @@ def build(wp_token_dim=None):
                 d[k] = v
         return d
 
-    deep_update(base, model_configs[name])
+    deep_update(base, copy.deepcopy(model_configs[name]))
     if wp_token_dim is not None:
         base["model"]["diffusion_module"]["wp_token_dim"] = wp_token_dim
     cfg = parse_configs(configs=base, arg_str=f"--model_name {name}",
@@ -69,7 +76,15 @@ def main() -> int:
     # what was asked for.  Checking "the named trunk modules got frozen" is the
     # weaker question and the one that passed while 0.46M of model-level trunk
     # parameters stayed trainable.
-    check("exactly the requested modules remain trainable",
+    # Parameter level, not module-name level: see freeze_trunk's comment on
+    # trainable_outside_request for why the module-set comparison is a trap.
+    check("no trainable parameter lies outside the requested modules",
+          not report["trainable_outside_request"],
+          f"{len(report['trainable_outside_request'])} leaked: "
+          f"{report['trainable_outside_request'][:3]}"
+          if report["trainable_outside_request"]
+          else f"all under {list(report['trainable_requested'])}")
+    check("and the requested module does hold trainable parameters",
           set(report["trainable_by_module"]) == set(TRAINABLE_MODULES),
           str(sorted(report["trainable_by_module"])))
     # Ask it of the parameters, not of the report's keys.  `frozen` only lists

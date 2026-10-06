@@ -43,6 +43,16 @@ basic_configs = {
     "skip_load_scheduler": False,
     "load_step_for_scheduler": False,
     "train_confidence_only": False,
+    # Kineidos (P004): do not run the confidence / distogram heads at all when
+    # their losses are off, rather than running them and weighting them to zero.
+    # See protenix/model/protenix.py's __init__ for why zero weights are not
+    # enough.  False reproduces upstream.
+    "skip_confidence": False,
+    "skip_distogram": False,
+    # Separate from skip_confidence on purpose: the mini-rollout block also
+    # permutes the label, and whether that permutation ever changes anything on
+    # GAGU is a measurement we have not made.  Requires skip_confidence.
+    "skip_mini_rollout": False,
     "use_wandb": True,
     "wandb_id": "",
     "seed": 42,
@@ -463,6 +473,42 @@ loss_configs = {
     },
 }
 
+# Kineidos (P004).  Two blocks: `wp` is the ablation's arm, `kineidos` is where
+# the GAGU data comes from.  Both are inert unless kineidos/train/trainer.py is
+# the entry point -- upstream's runner never reads them.
+kineidos_configs = {
+    "wp": {
+        # none | zero | random | pretrained (plan section 4).  `none` builds no
+        # fusion at all, which is what makes it the baseline rather than a
+        # fusion carrying zeros -- that is `zero`.
+        "mode": "none",
+        # Calibrated in plan section 2.10: 0.35 nm neighbourhood.  0.26 nm is
+        # the ablation alternative; changing this changes what h means, so it
+        # belongs in the config rather than in a default argument.
+        "particle_radius_nm": 0.0778,
+        # mode=pretrained only; Stage 1 has not produced one yet.
+        "checkpoint": "",
+        # Seeds WorldParticle's initialisation. -1 means "do not touch the
+        # global RNG", which is what a run that wants the global seed to govern
+        # everything should use.
+        "seed": -1,
+    },
+    "kineidos": {
+        "gagu_root": (
+            "/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/"
+            "datasets/processed/gagu_internal_loop_v0_1"
+        ),
+        # Named, not globbed: a run's config should say which trajectories it
+        # saw, so that a later run can be compared to it.
+        "train_samples": ListValue(["gagu_100mM_K_agaguu_startI_r1"]),
+        "window_k": 8,
+        # Nominal: an epoch is this many draws, not an enumeration (see
+        # GAGUWindowDataset).
+        "epoch_length": 10000,
+        "num_workers": 0,
+    },
+}
+
 configs = {
     **basic_configs,
     **data_configs,
@@ -470,5 +516,6 @@ configs = {
     **model_configs,
     **perm_configs,
     **loss_configs,
+    **kineidos_configs,
 }
 configs["finetune"] = finetune_optim_configs

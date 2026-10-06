@@ -192,6 +192,7 @@ class AF3Trainer(object):
         Sets up DistributedDataParallel (DDP) if multiple GPUs are used.
         """
         self.raw_model = Protenix(self.configs).to(self.device)
+        self.after_model_built()
         self.use_ddp = False
         if DIST_WRAPPER.world_size > 1:
             self.print("Using DistributedDataParallel (DDP)")
@@ -230,6 +231,15 @@ class AF3Trainer(object):
             param_names=self.configs.get("finetune_params_with_substring", [""]),
         )
         self.init_scheduler()
+
+    def after_model_built(self) -> None:
+        """Hook between constructing the model and wrapping or optimising it.
+
+        A no-op upstream.  Kineidos (P004) freezes the AF3 trunk here, and the
+        position is the point of the hook: DDP fixes at construction which
+        parameters it will reduce, and get_adamw filters on requires_grad, so a
+        parameter frozen any later is already registered with both.
+        """
 
     def init_scheduler(self, **kwargs: Any) -> None:
         """

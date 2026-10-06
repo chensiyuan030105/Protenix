@@ -109,6 +109,48 @@ class Protenix(nn.Module):
             assert configs.loss.weight.alpha_diffusion == 0.0
             assert configs.loss.weight.alpha_distogram == 0.0
 
+        # Kineidos (P004): train the diffusion head on MD trajectories with the
+        # trunk frozen.  Neither head has anything to learn from or to teach --
+        # confidence because MD frames carry no confidence labels, distogram
+        # because the trunk that feeds it does not move -- so they are not run
+        # at all rather than run and weighted to zero.  Defaults are False, so
+        # an unmodified config reproduces upstream exactly.
+        self.skip_confidence = configs.get("skip_confidence", False)
+        self.skip_distogram = configs.get("skip_distogram", False)
+        self.skip_mini_rollout = configs.get("skip_mini_rollout", False)
+        if self.skip_mini_rollout and not self.skip_confidence:
+            raise ValueError(
+                "skip_mini_rollout without skip_confidence: the confidence head "
+                "scores coordinate_mini, which only the rollout produces."
+            )
+        if self.train_confidence_only:
+            assert not self.skip_confidence, (
+                "train_confidence_only trains nothing but the confidence head, "
+                "and skip_confidence removes it; the two cannot both be set."
+            )
+        if self.skip_distogram:
+            assert configs.loss.weight.alpha_distogram == 0.0, (
+                "skip_distogram keeps 'distogram' out of pred_dict, so its loss "
+                "term is never built; a nonzero alpha_distogram would be a "
+                "weight on a loss that does not exist. Set it to 0.0."
+            )
+        if self.skip_confidence:
+            assert configs.loss.weight.alpha_confidence == 0.0, (
+                "skip_confidence keeps plddt/pae/pde/resolved out of pred_dict, "
+                "so the confidence loss terms are never built; a nonzero "
+                "alpha_confidence would be a weight on losses that do not "
+                "exist. Set it to 0.0."
+            )
+
+        # Set by the Kineidos trainer (P004) to a WPBridge, and left None
+        # otherwise.  It is assigned rather than constructed here so that
+        # protenix/ does not import kineidos/, but it is a submodule all the
+        # same -- which is the point.  Being inside the model is what makes DDP
+        # reduce its gradients, EMA track it, the optimizer see it and the
+        # checkpoint carry it; computing h outside the model and handing it in
+        # would get all four wrong, silently, and only on multi-GPU.
+        self.wp_bridge: Optional[nn.Module] = None
+
         # Diffusion scheduler
         self.train_noise_sampler = TrainingNoiseSampler(**configs.train_noise_sampler)
         self.inference_noise_scheduler = InferenceNoiseScheduler(
@@ -717,80 +759,107 @@ class Protenix(nn.Module):
         else:
             cache["pair_z"] = None
             cache["p_lm/c_l"] = [None, None]
-        # Mini-rollout: used for confidence and label permutation
-        with torch.no_grad():
-            # [..., 1, N_atom, 3]
-            N_sample_mini_rollout = self.configs.sample_diffusion[
-                "N_sample_mini_rollout"
-            ]  # =1
-            N_step_mini_rollout = self.configs.sample_diffusion["N_step_mini_rollout"]
-            self.diffusion_module.eval()  # use eval mode for mini-rollout
-            coordinate_mini = self.sample_diffusion(
-                denoise_net=self.diffusion_module,
+        # Mini-rollout, label permutation and confidence head.  Upstream runs
+        # all three unconditionally; the two switches below take them apart,
+        # because they are not one decision.
+        #
+        # skip_confidence drops the head and its four pred_dict keys.  That is
+        # what turns the confidence loss off: calculate_losses builds those
+        # terms iff plddt/pae/pde/resolved are present.  Zeroing the weight
+        # instead would still pay for the head and the rollout, and would not
+        # keep a NaN out of the total -- 0.0 * nan is nan, and train_step
+        # answers a NaN loss by skipping the iteration, so the failure mode is
+        # training that runs and learns nothing.
+        #
+        # skip_mini_rollout is a separate and later decision, because the
+        # rollout block also calls permute_label_to_match_mini_rollout, which
+        # *updates label_dict* (chain_permutation.train.mini_rollout and
+        # atom_permutation.train.mini_rollout are both True by default).  For
+        # GAGU the atom permutation is identity by construction, but the two
+        # chains are equivalent copies sharing one entity id, so the chain
+        # permutation is live and may genuinely relabel the ground truth that
+        # the diffusion loss then trains against.  Whether that relabelling
+        # ever happens is a measurement, not an assumption, so the default
+        # keeps paying for the rollout and only the head goes away.
+        if not self.skip_mini_rollout:
+            # Mini-rollout: used for confidence and label permutation
+            with torch.no_grad():
+                # [..., 1, N_atom, 3]
+                N_sample_mini_rollout = self.configs.sample_diffusion[
+                    "N_sample_mini_rollout"
+                ]  # =1
+                N_step_mini_rollout = self.configs.sample_diffusion["N_step_mini_rollout"]
+                self.diffusion_module.eval()  # use eval mode for mini-rollout
+                coordinate_mini = self.sample_diffusion(
+                    denoise_net=self.diffusion_module,
+                    input_feature_dict=input_feature_dict,
+                    s_inputs=s_inputs.detach(),
+                    s_trunk=s.detach(),
+                    z_trunk=None if cache["pair_z"] is not None else z.detach(),
+                    pair_z=None if cache["pair_z"] is None else cache["pair_z"].detach(),
+                    p_lm=(
+                        None
+                        if cache["p_lm/c_l"][0] is None
+                        else cache["p_lm/c_l"][0].detach()
+                    ),
+                    c_l=(
+                        None
+                        if cache["p_lm/c_l"][1] is None
+                        else cache["p_lm/c_l"][1].detach()
+                    ),
+                    N_sample=N_sample_mini_rollout,
+                    noise_schedule=self.inference_noise_scheduler(
+                        N_step=N_step_mini_rollout,
+                        device=s_inputs.device,
+                        dtype=s_inputs.dtype,
+                    ),
+                    enable_efficient_fusion=self.enable_efficient_fusion,
+                )
+                self.diffusion_module.train()
+                coordinate_mini.detach_()
+                pred_dict["coordinate_mini"] = coordinate_mini
+
+                # Permute ground truth to match mini-rollout prediction
+                (
+                    label_dict,
+                    perm_log_dict,
+                ) = symmetric_permutation.permute_label_to_match_mini_rollout(
+                    coordinate_mini,
+                    input_feature_dict,
+                    label_dict,
+                    label_full_dict,
+                )
+                log_dict.update(perm_log_dict)
+
+        # The head itself.  It consumes coordinate_mini, which only exists when
+        # the rollout above ran -- hence the assertion in __init__ that
+        # skip_mini_rollout implies skip_confidence.
+        if not self.skip_confidence:
+            # Confidence: use mini-rollout prediction, and detach token embeddings
+            drop_embedding = (
+                random.random() < self.configs.model.confidence_embedding_drop_rate
+            )
+            plddt_pred, pae_pred, pde_pred, resolved_pred = self.run_confidence_head(
                 input_feature_dict=input_feature_dict,
-                s_inputs=s_inputs.detach(),
-                s_trunk=s.detach(),
-                z_trunk=None if cache["pair_z"] is not None else z.detach(),
-                pair_z=None if cache["pair_z"] is None else cache["pair_z"].detach(),
-                p_lm=(
-                    None
-                    if cache["p_lm/c_l"][0] is None
-                    else cache["p_lm/c_l"][0].detach()
-                ),
-                c_l=(
-                    None
-                    if cache["p_lm/c_l"][1] is None
-                    else cache["p_lm/c_l"][1].detach()
-                ),
-                N_sample=N_sample_mini_rollout,
-                noise_schedule=self.inference_noise_scheduler(
-                    N_step=N_step_mini_rollout,
-                    device=s_inputs.device,
-                    dtype=s_inputs.dtype,
-                ),
-                enable_efficient_fusion=self.enable_efficient_fusion,
+                s_inputs=s_inputs,
+                s_trunk=s,
+                z_trunk=z,
+                pair_mask=None,
+                x_pred_coords=coordinate_mini,
+                use_embedding=not drop_embedding,
+                triangle_multiplicative=self.configs.triangle_multiplicative,
+                triangle_attention=self.configs.triangle_attention,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
             )
-            self.diffusion_module.train()
-            coordinate_mini.detach_()
-            pred_dict["coordinate_mini"] = coordinate_mini
-
-            # Permute ground truth to match mini-rollout prediction
-            (
-                label_dict,
-                perm_log_dict,
-            ) = symmetric_permutation.permute_label_to_match_mini_rollout(
-                coordinate_mini,
-                input_feature_dict,
-                label_dict,
-                label_full_dict,
+            pred_dict.update(
+                {
+                    "plddt": plddt_pred,
+                    "pae": pae_pred,
+                    "pde": pde_pred,
+                    "resolved": resolved_pred,
+                }
             )
-            log_dict.update(perm_log_dict)
-
-        # Confidence: use mini-rollout prediction, and detach token embeddings
-        drop_embedding = (
-            random.random() < self.configs.model.confidence_embedding_drop_rate
-        )
-        plddt_pred, pae_pred, pde_pred, resolved_pred = self.run_confidence_head(
-            input_feature_dict=input_feature_dict,
-            s_inputs=s_inputs,
-            s_trunk=s,
-            z_trunk=z,
-            pair_mask=None,
-            x_pred_coords=coordinate_mini,
-            use_embedding=not drop_embedding,
-            triangle_multiplicative=self.configs.triangle_multiplicative,
-            triangle_attention=self.configs.triangle_attention,
-            inplace_safe=inplace_safe,
-            chunk_size=chunk_size,
-        )
-        pred_dict.update(
-            {
-                "plddt": plddt_pred,
-                "pae": pae_pred,
-                "pde": pde_pred,
-                "resolved": resolved_pred,
-            }
-        )
 
         if self.train_confidence_only:
             # Skip diffusion loss and distogram loss. Return now.
@@ -823,14 +892,19 @@ class Protenix(nn.Module):
         )
         pred_dict.update(
             {
-                "distogram": autocasting_disable_decorator(True)(self.distogram_head)(
-                    z
-                ),
                 # [..., N_sample=48, N_atom, 3]: diffusion loss
                 "coordinate": x_denoised,
                 "noise_level": x_noise_level,
             }
         )
+        # Same reasoning as the confidence block above: calculate_losses builds
+        # the distogram loss term iff this key is present, so not writing it is
+        # what turns the loss off.  permute_diffusion_sample_to_match_label,
+        # which runs next, only touches pred_dict["coordinate"].
+        if not self.skip_distogram:
+            pred_dict["distogram"] = autocasting_disable_decorator(True)(
+                self.distogram_head
+            )(z)
 
         # Permute symmetric atom/chain in each sample to match true structure
         # Note: currently chains cannot be permuted since label is cropped
@@ -877,6 +951,15 @@ class Protenix(nn.Module):
         assert mode in ["train", "eval", "inference"]
         not_use_gradient = not (self.training or torch.is_grad_enabled())
         inplace_safe = not_use_gradient and (not disable_inplace)
+
+        # WorldParticle tokens, before anything else touches the features.
+        # Order matters and is a correctness question, not a style one (plan
+        # 2.9.4): WorldParticle must see the canonicalised window the
+        # dataloader produced, while Protenix sees coordinates that
+        # centre_random_augmentation will later rotate.  Computing h here, from
+        # the dataloader's own tensors, is what keeps those two apart.
+        if self.wp_bridge is not None:
+            input_feature_dict["wp_tokens"] = self.wp_bridge(input_feature_dict)
 
         input_feature_dict = self.relative_position_encoding.generate_relp(
             input_feature_dict

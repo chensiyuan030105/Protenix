@@ -67,6 +67,36 @@ K_PARTITE = 2
 CANONICAL_TOL_NM = 1e-4
 
 
+# The window tensors WorldParticle needs, as they travel in the feature dict.
+# They go through the feature dict rather than as a Window object for one
+# practical reason: the trainer calls to_device on the batch, which moves
+# tensors inside dictionaries and would leave a dataclass's fields on the CPU.
+WP_INPUT_KEYS = (
+    "wp_position_nm",
+    "wp_velocity_nm_per_ps",
+    "wp_frame_time_ns",
+    "wp_frame_mask",
+    "wp_ref_pos_nm",
+    "wp_canonicalized",
+)
+
+
+def wp_inputs_from_window(window) -> dict[str, torch.Tensor]:
+    """The WP_INPUT_KEYS subset of a Window, all as tensors.
+
+    `canonicalized` becomes a 0-d tensor rather than staying a Python bool so
+    that it survives to_device and any collation unchanged in kind.
+    """
+    return {
+        "wp_position_nm": window.wp_position_nm,
+        "wp_velocity_nm_per_ps": window.wp_velocity_nm_per_ps,
+        "wp_frame_time_ns": window.wp_frame_time_ns,
+        "wp_frame_mask": window.wp_frame_mask,
+        "wp_ref_pos_nm": window.ref_pos_nm,
+        "wp_canonicalized": torch.tensor(bool(window.canonicalized)),
+    }
+
+
 class WorldParticleBridge(nn.Module):
     """Turns a history window into the per-particle tokens `h`, or into nothing.
 
@@ -141,7 +171,7 @@ class WorldParticleBridge(nn.Module):
 
     # ---------------------------------------------------------------- checks
 
-    def assert_window_canonical(self, window, tol_nm: float = CANONICAL_TOL_NM) -> float:
+    def assert_window_canonical(self, feats, tol_nm: float = CANONICAL_TOL_NM) -> float:
         """Confirm nothing transformed the window after the dataloader.
 
         Canonicalisation is idempotent, so re-aligning an already-canonical
@@ -158,10 +188,10 @@ class WorldParticleBridge(nn.Module):
         sensible tolerance and harmless.  A transform applied afterwards moves
         atoms by nanometres.
         """
-        if not getattr(window, "canonicalized", False):
+        if not bool(feats["wp_canonicalized"]):
             return float("nan")
-        pos = window.wp_position_nm.detach().double().cpu().numpy()
-        ref = window.ref_pos_nm.detach().double().cpu().numpy()
+        pos = feats["wp_position_nm"].detach().double().cpu().numpy()
+        ref = feats["wp_ref_pos_nm"].detach().double().cpu().numpy()
         again, _, _ = canonicalize_window(pos, None, ref)
         drift = float(np.abs(again - pos).max())
         if drift > tol_nm:
@@ -175,7 +205,7 @@ class WorldParticleBridge(nn.Module):
 
     # ------------------------------------------------------------- features
 
-    def _frame_time_feature(self, window) -> torch.Tensor:
+    def _frame_time_feature(self, feats) -> torch.Tensor:
         """Per-frame time, as a channel WorldParticle can use.
 
         Normalised to the window's own span, giving -1 for the oldest frame and
@@ -191,13 +221,13 @@ class WorldParticleBridge(nn.Module):
         so this channel only has to say where in the window each frame sits.
         Pooling destroys order, which is the whole reason it exists.
         """
-        t = window.wp_frame_time_ns.detach().float()
+        t = feats["wp_frame_time_ns"].detach().float()
         span = t.abs().max().clamp(min=1e-12)
         return (t / span).unsqueeze(-1)          # [K, 1], in [-1, -1/K]
 
     # -------------------------------------------------------------- forward
 
-    def forward(self, window) -> Optional[torch.Tensor]:
+    def forward(self, feats) -> Optional[torch.Tensor]:
         """`h` for one window: [N, 768], or None in `none` mode.
 
         WorldParticle takes one frame at a time, so the K history frames are run
@@ -206,30 +236,37 @@ class WorldParticleBridge(nn.Module):
         must not contribute, and a plain mean over K would quietly average them
         in near the start of a trajectory.
         """
-        n_atom = window.wp_position_nm.shape[1]
+        missing = [k for k in WP_INPUT_KEYS if k not in feats]
+        if self.mode != "none" and missing:
+            raise KeyError(
+                f"the feature dict is missing {missing}; the collate has to put "
+                f"the window's WorldParticle tensors there (see WP_INPUT_KEYS)"
+            )
+        position = feats["wp_position_nm"]
+        n_atom = position.shape[1]
 
         if self.mode == "none":
             return None
         if self.mode == "zero":
             # Shaped like the real thing and carrying nothing. The fusion runs,
             # so this arm answers whether the pathway alone changes behaviour.
-            return window.wp_position_nm.new_zeros((n_atom, self.token_dim))
+            return position.new_zeros((n_atom, self.token_dim))
 
-        self.assert_window_canonical(window)
+        self.assert_window_canonical(feats)
 
-        time_feat = self._frame_time_feature(window)
-        mask = window.wp_frame_mask.detach().to(torch.bool)
+        time_feat = self._frame_time_feature(feats)
+        mask = feats["wp_frame_mask"].detach().to(torch.bool)
         if not bool(mask.any()):
             raise ValueError("no valid history frame in this window")
 
         tokens = []
-        for k in range(window.wp_position_nm.shape[0]):
+        for k in range(position.shape[0]):
             if not bool(mask[k]):
                 continue
             other = time_feat[k].expand(n_atom, self.time_channels).contiguous()
             out = self.wp.compute_correction(
-                window.wp_position_nm[k],
-                window.wp_velocity_nm_per_ps[k],
+                position[k],
+                feats["wp_velocity_nm_per_ps"][k],
                 other,
                 None,
                 None,
