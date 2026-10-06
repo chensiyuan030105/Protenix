@@ -765,6 +765,13 @@ class AtomAttentionEncoder(nn.Module):
                 in_features=c_atom + wp_token_dim, out_features=c_atom
             )
             self._init_wp_fusion()
+            # Plan section 5 wants the end-to-end injection strength
+            # observable during training, not recoverable from a checkpoint
+            # afterwards.  v0.1 ran 5500 steps and produced conclusions before
+            # anyone found that the net injection was 1e-3 and the branch had
+            # never participated.  Filled on every fused forward; see
+            # _fuse_wp_tokens.
+            self.wp_diagnostics: dict[str, float] = {}
 
     def prepare_cache(
         self,
@@ -919,7 +926,33 @@ class AtomAttentionEncoder(nn.Module):
         if h.dim() == c_l.dim() - 1:
             h = h.unsqueeze(dim=-3)
         h = h.expand(*c_l.shape[:-1], h.shape[-1])
-        return self.wp_fusion(torch.cat([c_l, h], dim=-1))
+        fused = self.wp_fusion(torch.cat([c_l, h], dim=-1))
+
+        # The two halves' contributions, measured rather than inferred from the
+        # weights.  A weight-norm ratio can look healthy while the branch
+        # contributes nothing, because it says nothing about the scale of what
+        # the weights multiply -- which is exactly how v0.1's gate looked
+        # plausible at 3e-3.  Under no_grad and only norms, so the cost is a
+        # handful of reductions.
+        with torch.no_grad():
+            w = self.wp_fusion.weight
+            cl_part = c_l @ w[:, : self.c_atom].T
+            h_part = h @ w[:, self.c_atom :].T
+            cl_norm = cl_part.norm().item()
+            self.wp_diagnostics = {
+                "w_cl_norm": w[:, : self.c_atom].norm().item(),
+                "w_h_norm": w[:, self.c_atom :].norm().item(),
+                "cl_contribution_norm": cl_norm,
+                "h_contribution_norm": h_part.norm().item(),
+                # The number section 5 actually asks for: how much of c_l'
+                # comes from WorldParticle.  0 at initialisation by
+                # construction, and if it is still ~0 after training the branch
+                # never participated.
+                "injection_strength": (h_part.norm() / cl_part.norm()).item()
+                if cl_norm > 0 else float("nan"),
+                "h_norm_after_layernorm": h.norm().item(),
+            }
+        return fused
 
     def forward(
         self,
