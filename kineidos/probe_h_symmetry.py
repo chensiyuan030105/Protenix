@@ -36,6 +36,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from kineidos.window_align import canonicalize_window
+
 GAGU_DEFAULT = Path(
     "/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/"
     "processed/gagu_internal_loop_v0_1/gagu_100mM_K_agaguu_startI_r1"
@@ -73,7 +75,8 @@ WP_CONFIG = dict(
 K_PARTITE = 2
 
 
-def load_gagu_heavy(sample_dir: Path, n_frames: int = 1) -> tuple[np.ndarray, np.ndarray]:
+def load_gagu_heavy(sample_dir: Path, n_frames: int = 1, window_from: int = 0
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Frame 0 heavy-atom positions and velocities, in the PDB's atom order.
 
     Protenix removes hydrogens (Filter.remove_hydrogens, several call sites in
@@ -104,10 +107,16 @@ def load_gagu_heavy(sample_dir: Path, n_frames: int = 1) -> tuple[np.ndarray, np
     # ill-conditioned for the same reason too few rows would.
     with np.load(npz_path) as z:
         total = z["position"].shape[0]
-        idx = np.linspace(0, total - 1, n_frames, dtype=int)
+        idx = np.linspace(window_from, total - 1, n_frames, dtype=int)
         pos_nm = np.asarray(z["position"][idx], dtype=np.float64)  # [F, A, 3] nm
         vel_nm = np.asarray(z["velocity"][idx], dtype=np.float64)
-    print(f"  frames: {list(idx)} of {total}")
+        # The reference conformer is always trajectory frame 0, which is what the
+        # PDB holds and what Protenix uses as ref_pos.  Loading it separately
+        # from the window matters: with window_from=0 the window's anchor *is*
+        # the reference, the unrotated alignment degenerates to the identity,
+        # and the test stops exercising the case training will actually see.
+        ref_nm = np.asarray(z["position"][0], dtype=np.float64)
+    print(f"  window frames: {list(idx)} of {total}; reference = frame 0")
 
     assert len(elements) == pos_nm.shape[1], (
         f"PDB has {len(elements)} atoms, npz has {pos_nm.shape[1]}"
@@ -116,14 +125,17 @@ def load_gagu_heavy(sample_dir: Path, n_frames: int = 1) -> tuple[np.ndarray, np
     # The atom-order contract, checked by coordinates rather than by shape: a
     # permuted array of the same length would pass a shape check and train a
     # quietly wrong model.
-    align = float(np.abs(pdb_xyz - pos_nm[0] * 10.0).max())
+    # Compared against ref_nm, which is trajectory frame 0 -- not against the
+    # window's first frame, which is frame `window_from` and has no reason to
+    # match the PDB.
+    align = float(np.abs(pdb_xyz - ref_nm * 10.0).max())
     assert align < 1e-3, f"PDB is not npz frame 0: max |diff| = {align:.3e} A"
     print(f"  atom order contract: max |pdb - npz[0]| = {align:.6e} A")
 
     heavy = np.array([e != "H" for e in elements], dtype=bool)
     print(f"  atoms: {len(elements)} all -> {int(heavy.sum())} heavy "
           f"({int((~heavy).sum())} hydrogens removed)")
-    return pos_nm[:, heavy], vel_nm[:, heavy]
+    return pos_nm[:, heavy], vel_nm[:, heavy], ref_nm[heavy]
 
 
 def pick_particle_radius(pos: np.ndarray, target_neighbors: int = 24) -> float:
@@ -221,6 +233,31 @@ def flatten(t: torch.Tensor) -> torch.Tensor:
     return t.squeeze(0) if t.dim() == 3 and t.shape[0] == 1 else t
 
 
+def prepare(pos: np.ndarray, vel: np.ndarray, ref: np.ndarray, *,
+            rot: np.ndarray | None = None, shift: np.ndarray | None = None,
+            align: bool) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Apply a rigid motion to the window, then canonicalise if asked.
+
+    The motion goes on first: the question being measured is what the model sees
+    when the *input data* arrives in an arbitrary pose, so canonicalisation has
+    to run on the moved window exactly as it would at training time.
+
+    `ref` is deliberately never moved.  It is the fixed external reference that
+    makes the pose canonical -- rotating it along with the data would reproduce
+    the "align to the window's own oldest frame" construction, which leaves the
+    global orientation in place (see kineidos/window_align.py).
+    """
+    p, v = pos, vel
+    if rot is not None:
+        p, v = p @ rot.T, v @ rot.T
+    if shift is not None:
+        p = p + shift
+    if not align:
+        return p, v, {}
+    p, v, info = canonicalize_window(p, v, ref)
+    return p, v, info
+
+
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:
     """Relative difference, scaled by the reference so it reads as a fraction."""
     denom = a.norm().item()
@@ -265,11 +302,21 @@ def main() -> int:
                          "each, and the fit needs well over 768 rows to be "
                          "identifiable at all")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--window-from", type=int, default=0,
+                    help="first trajectory frame of the window; the reference "
+                         "conformer stays frame 0 regardless, so a non-zero "
+                         "value is what makes the anchor differ from the "
+                         "reference as it will in training")
+    ap.add_argument("--align", action="store_true",
+                    help="canonicalise each window before WorldParticle sees it "
+                         "(kineidos/window_align.py); this is the remedy P004.1 "
+                         "settled on, and with it h must come out invariant")
     ap.add_argument("--report", type=Path, default=None)
     args = ap.parse_args()
 
     print("=== 1. input ===")
-    pos, vel = load_gagu_heavy(args.sample, n_frames=args.frames)
+    pos, vel, ref = load_gagu_heavy(args.sample, n_frames=args.frames,
+                                    window_from=args.window_from)
     n_frames, n, _ = pos.shape
     radius = pick_particle_radius(pos[0])
     extent = radius * WP_CONFIG["radius_scale"] * 6
@@ -286,13 +333,24 @@ def main() -> int:
     t = np.array([1.7, -0.9, 2.3])
 
     print("\n=== 3. forward passes ===")
+    print(f"  canonicalisation: {'ON' if args.align else 'OFF'}")
+
+    p_plain, v_plain, info = prepare(pos, vel, ref, align=args.align)
+    p_rot, v_rot, info_rot = prepare(pos, vel, ref, rot=R, align=args.align)
+    p_tr, v_tr, _ = prepare(pos, vel, ref, shift=t, align=args.align)
+    if args.align:
+        print(f"  anchor RMSD to ref: {info['anchor_rmsd_to_ref']:.4f} nm "
+              f"(rotated window: {info_rot['anchor_rmsd_to_ref']:.4f} nm)")
+        drift = float(np.abs(p_plain - p_rot).max())
+        print(f"  canonicalised windows agree: max |aligned(x) - aligned(Rx)| "
+              f"= {drift:.3e} nm")
+
     plain, rotated, translated = [], [], []
     for f in range(n_frames):
-        out, cap = run_once(model, pos[f], vel[f])
-        plain.append((out, cap))
-        rotated.append(run_once(model, pos[f] @ R.T, vel[f] @ R.T))
+        plain.append(run_once(model, p_plain[f], v_plain[f]))
+        rotated.append(run_once(model, p_rot[f], v_rot[f]))
         if f == 0:  # translation needs no stacking: no fit is involved
-            translated.append(run_once(model, pos[f] + t, vel[f]))
+            translated.append(run_once(model, p_tr[f], v_tr[f]))
         print(f"  frame {f + 1}/{n_frames} done")
 
     out0, cap0 = plain[0]
@@ -372,6 +430,8 @@ def main() -> int:
 
     record = {
         "sample": str(args.sample), "seed": args.seed, "frames": n_frames,
+        "window_from": args.window_from, "canonicalized": bool(args.align),
+        "anchor_rmsd_to_ref": info.get("anchor_rmsd_to_ref"),
         "n_particles": n, "particle_radius": radius,
         "filter_extent_nm": extent, "search_cutoff_nm": extent / 2,
         "mean_neighbours": avg_nb, "h_shape": list(h.shape),
