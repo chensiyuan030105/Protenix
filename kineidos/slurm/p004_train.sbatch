@@ -11,15 +11,26 @@
 # The arm is the one argument that must be given:
 #   sbatch --export=ALL,WP_MODE=zero kineidos/slurm/p004_train.sbatch
 #SBATCH --job-name=p004-kineidos
-#SBATCH --partition=background
-#SBATCH --qos=background
+# h100, not background.  Both are open to grad-students, but PreemptType is
+# preempt/partition_prio with PreemptMode=REQUEUE and PreemptExemptTime=0, and
+# background sits at PriorityTier=5 while h100 and high-priority sit at 10.  A
+# background job is therefore killed without grace and restarted from step 0 --
+# and this trainer cannot resume (try_load_checkpoint requires the missing key
+# set to equal the fusion's, which a full mid-run checkpoint does not satisfy),
+# so the restart would quietly begin again in a new timestamped run directory.
+# h100's partition QoS is background, so this does not spend the high-priority
+# QoS's 12-GPU allowance either.
+#SBATCH --partition=h100
 #SBATCH --account=grad-students
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+# h100 has MaxTime=UNLIMITED and DefaultTime=08:00:00.  Asking for more than we
+# need costs nothing here (the partition is idle and not preemptible) and losing
+# a run to the wall clock costs everything, since there is no resume path yet.
+#SBATCH --time=48:00:00
 #SBATCH --output=/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace/runs/slurm/%x-%j.out
 #SBATCH --error=/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace/runs/slurm/%x-%j.err
 
@@ -31,7 +42,7 @@ CHECKPOINT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/run
 
 WP_MODE="${WP_MODE:?set WP_MODE to none, zero, random or pretrained}"
 RUN_NAME="${RUN_NAME:-p004_${WP_MODE}}"
-MAX_STEPS="${MAX_STEPS:-2000}"
+MAX_STEPS="${MAX_STEPS:-100000}"
 SEED="${SEED:-42}"
 # Disk arithmetic, because /mnt/xfs sits at 97% (AGENTS.md).  save_checkpoint
 # writes the whole 368.60M state_dict plus Adam's two moments for the 203.37M
@@ -41,7 +52,18 @@ SEED="${SEED:-42}"
 # but the interval is what bounds the cost: at 500 and MAX_STEPS=2000 that is
 # five files, ~16 GB per arm, ~47 GB for none/zero/random.  Raise the interval
 # before raising MAX_STEPS.
-CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-500}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-2000}"
+
+# Train / held-out split.  The 64 GAGU trajectories are a balanced
+# 2 salt x 4 sequence x 2 start x 4 replicate design, so the split can be made
+# along one axis cleanly.  Replicates r1-r3 train, r4 is held out: same
+# chemistry, same conditions, different MD noise.  That asks "did it learn the
+# dynamics" rather than "did it memorise this trajectory" -- the weaker of the
+# two questions, and the one to settle first.  Holding out a whole sequence
+# instead asks about chemistry generalisation and is a separate set of runs.
+GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/processed/gagu_internal_loop_v0_1"
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-$(ls -d ${GAGU_ROOT}/*_r[123] 2>/dev/null | xargs -n1 basename | paste -sd,)}"
+N_TRAIN=$(echo "${TRAIN_SAMPLES}" | tr ',' '\n' | grep -c .)
 
 mkdir -p "${WORKSPACE}/runs/slurm" "${WORKSPACE}/runs/p004"
 cd "${WORKSPACE}"
@@ -64,6 +86,7 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 
 echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
 echo "WP_MODE=${WP_MODE} RUN_NAME=${RUN_NAME} MAX_STEPS=${MAX_STEPS} SEED=${SEED}"
+echo "TRAIN_SAMPLES: ${N_TRAIN} trajectories (r1-r3); r4 held out"
 "${ENV}/bin/python" -u -c 'import torch; print("torch", torch.__version__, "cuda", torch.cuda.is_available(), torch.cuda.device_count())'
 
 # env.lock is written by the trainer, into the run directory it creates --
@@ -78,7 +101,7 @@ exec "${ENV}/bin/python" -u -m kineidos.train.main \
   --base_dir "${WORKSPACE}/runs/p004" \
   --max_steps "${MAX_STEPS}" \
   --seed "${SEED}" \
-  --log_interval 20 \
+  --log_interval 50 \
   --eval_interval -1 \
   --checkpoint_interval "${CHECKPOINT_INTERVAL}" \
   --use_wandb false \
@@ -86,4 +109,6 @@ exec "${ENV}/bin/python" -u -m kineidos.train.main \
   --skip_distogram true \
   --loss.weight.alpha_confidence 0.0 \
   --loss.weight.alpha_distogram 0.0 \
+  --kineidos.train_samples "${TRAIN_SAMPLES}" \
+  --kineidos.num_workers 4 \
   "$@"
