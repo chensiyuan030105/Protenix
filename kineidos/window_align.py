@@ -77,6 +77,29 @@ def kabsch_rotation(mobile: np.ndarray, target: np.ndarray) -> np.ndarray:
     return (vt.T @ correction @ u.T).T
 
 
+def inter_frame_rotation_deg(pos: np.ndarray) -> float:
+    """Largest rotation, in degrees, between consecutive frames of a window.
+
+    The canonicalisation applies one transform taken from the anchor, so
+    tumbling *within* the window survives it and reaches `h`, which is not
+    rotation invariant.  On GAGU that is harmless -- the trajectories were
+    RMSD-fitted upstream and consecutive frames differ by 0.5-0.8 degrees
+    whatever the stride, against 126.9 degrees for random orientations.  But
+    that is a property of the data, not a guarantee, and a dataset that has not
+    been fitted would fail silently: `h` would carry each frame's orientation
+    and the only symptom would be that WorldParticle contributes nothing.
+
+    Reported rather than asserted here; the caller decides the threshold,
+    since what counts as too much depends on what the window is for.
+    """
+    worst = 0.0
+    for a, b in zip(pos[:-1], pos[1:]):
+        rot = kabsch_rotation(a - a.mean(axis=0), b - b.mean(axis=0))
+        cos = (np.trace(rot) - 1.0) / 2.0
+        worst = max(worst, float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))))
+    return worst
+
+
 def canonicalize_window(
     pos: np.ndarray,
     vel: np.ndarray | None,

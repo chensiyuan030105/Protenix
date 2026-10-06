@@ -42,7 +42,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from kineidos.window_align import canonicalize_window
+from kineidos.window_align import canonicalize_window, inter_frame_rotation_deg
 
 DT_MIN_NS = 0.1
 DT_MAX_NS = 100.0
@@ -69,6 +69,7 @@ class Window:
     wp_frame_time_ns: torch.Tensor  # [K] negative, oldest most negative
     wp_frame_mask: torch.Tensor     # [K] bool; False marks padding
     anchor_rmsd_to_ref_nm: float
+    inter_frame_rotation_deg: float
 
     features: dict[str, torch.Tensor]        # Protenix, Angstroms
     labels: dict[str, torch.Tensor]          # Protenix, Angstroms
@@ -105,6 +106,7 @@ def build_window(
     stride: int,
     k: int = 8,
     canonicalize: bool = True,
+    max_inter_frame_rotation_deg: float = 15.0,
 ) -> Window:
     """Assemble one window ending at `target_frame`.
 
@@ -118,6 +120,13 @@ def build_window(
         k: how many history frames.
         canonicalize: put the window in a canonical pose before WorldParticle
             sees it.  Leave on; off is for measuring what it buys.
+        max_inter_frame_rotation_deg: raise if the molecule turns more than this
+            between consecutive frames of the window.  Canonicalisation removes
+            the window's global pose but not tumbling *within* it, and `h` is
+            not rotation invariant, so an unfitted trajectory would quietly feed
+            each frame's orientation into the conditioning signal.  GAGU sits at
+            0.5-0.8 degrees because it was RMSD-fitted upstream; 15 is far above
+            that and far below the 126.9 degrees of random orientations.
 
     Protenix's relative-position encoding is deliberately not applied here.  The
     v1 adapter called update_input_feature_dict and
@@ -151,6 +160,20 @@ def build_window(
     pos_nm = sample.position_nm[frames].astype(np.float64)
     vel_nm = sample.velocity_nm_per_ps[frames].astype(np.float64)
 
+    # Measured before canonicalisation, which cannot change it: one rigid
+    # transform applied to every frame leaves inter-frame angles untouched.
+    turn = inter_frame_rotation_deg(pos_nm[valid]) if valid.sum() > 1 else 0.0
+    if turn > max_inter_frame_rotation_deg:
+        raise ValueError(
+            f"{sample.sample_id} frame {target_frame}, stride {stride}: the "
+            f"molecule turns {turn:.1f} deg between consecutive history frames, "
+            f"over the {max_inter_frame_rotation_deg} deg limit. Canonicalisation "
+            f"removes the window's global pose but not tumbling inside it, and "
+            f"`h` is not rotation invariant, so this trajectory would feed each "
+            f"frame's orientation into the conditioning signal. Fit the "
+            f"trajectory upstream, or see plan section 2.9.5."
+        )
+
     info = {"anchor_rmsd_to_ref": float("nan")}
     if canonicalize:
         pos_nm, vel_nm, info = canonicalize_window(
@@ -182,6 +205,7 @@ def build_window(
         wp_frame_time_ns=torch.from_numpy(frame_time).float(),
         wp_frame_mask=torch.from_numpy(valid.copy()),
         anchor_rmsd_to_ref_nm=float(info["anchor_rmsd_to_ref"]),
+        inter_frame_rotation_deg=float(turn),
         features=features,
         labels=labels,
     )

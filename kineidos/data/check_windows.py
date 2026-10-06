@@ -88,6 +88,12 @@ def main() -> int:
     check("all frames valid away from the start", bool(w.wp_frame_mask.all()))
     check("canonicalisation ran", np.isfinite(w.anchor_rmsd_to_ref_nm),
           f"anchor RMSD {w.anchor_rmsd_to_ref_nm:.4f} nm")
+    # GAGU was RMSD-fitted upstream, so this should be fractions of a degree.
+    # The number is reported rather than merely bounded: a dataset that drifts
+    # towards the 15 deg limit is one where `h` starts carrying per-frame
+    # orientation, and noticing that early is the point of recording it.
+    check("inter-frame tumbling is negligible", w.inter_frame_rotation_deg < 2.0,
+          f"{w.inter_frame_rotation_deg:.2f} deg (limit 15, random would be 126.9)")
 
     print("\n=== 5. padding and mask near the start ===")
     w2 = build_window(sample, target_frame=300, stride=100, k=8)
@@ -133,6 +139,24 @@ def main() -> int:
     vdrift = float((w.wp_velocity_nm_per_ps - w_rot.wp_velocity_nm_per_ps).abs().max())
     check("velocities canonicalise with the positions", vdrift < 1e-4,
           f"max |diff| {vdrift:.3e} nm/ps")
+
+    print("\n=== 6b. the tumbling guard fires on an unfitted window ===")
+    # Rotate each frame of the trajectory by a growing angle, which is what an
+    # unfitted trajectory looks like, and confirm build_window refuses it rather
+    # than quietly feeding per-frame orientations into h.
+    spun = sample.position_nm.copy()
+    for i in range(1, 9):
+        a = np.radians(20.0 * i)
+        c, s_ = np.cos(a), np.sin(a)
+        R = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+        spun[i] = spun[i] @ R.T
+    spun_sample = type(sample)(**{**sample.__dict__, "position_nm": spun})
+    try:
+        build_window(spun_sample, target_frame=9, stride=1, k=8)
+        check("guard refuses a tumbling window", False, "it did not raise")
+    except ValueError as exc:
+        check("guard refuses a tumbling window", "turns" in str(exc),
+              str(exc).split(".")[0][:70])
 
     print("\n=== 7. dataset is deterministic per index ===")
     ds = GAGUWindowDataset([sample], k=8, length=64, seed=0)
