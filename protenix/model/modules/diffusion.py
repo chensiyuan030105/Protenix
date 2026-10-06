@@ -270,6 +270,9 @@ class DiffusionModule(nn.Module):
         drop_path_rate: float = 0.0,
         blocks_per_ckpt: Optional[int] = None,
         use_fine_grained_checkpoint: bool = False,
+        # Kineidos: width of WorldParticle's per-particle tokens, or None to
+        # keep this module byte-identical to upstream.
+        wp_token_dim: Optional[int] = None,
     ) -> None:
         super(DiffusionModule, self).__init__()
         self.sigma_data = sigma_data
@@ -296,6 +299,10 @@ class DiffusionModule(nn.Module):
             c_s=c_s,
             c_z=c_z,
             blocks_per_ckpt=blocks_per_ckpt,
+            # Kineidos: only this encoder fuses WorldParticle's tokens.  The
+            # other instance of AtomAttentionEncoder lives in embedders.py
+            # inside the frozen trunk and is left at wp_token_dim=None.
+            wp_token_dim=wp_token_dim,
         )
         # Alg20: line4
         self.layernorm_s = LayerNorm(c_s, create_offset=False)
@@ -409,6 +416,12 @@ class DiffusionModule(nn.Module):
             z_pair, dim=-4, n=1
         )  # [..., N_sample, N_token, N_token, c_z]
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
+        # Kineidos: h travels in input_feature_dict, the channel every other
+        # per-atom input already uses, so no caller between here and the
+        # dataloader needs a new argument.  Absent, or wp_token_dim None, and
+        # the encoder ignores it.
+        wp_tokens = input_feature_dict.get("wp_tokens", None)
+
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
             checkpoint_fn = get_checkpoint_fn()
             a_token, q_skip, c_skip, p_skip = checkpoint_fn(
@@ -427,6 +440,11 @@ class DiffusionModule(nn.Module):
                 z_pair,
                 p_lm,
                 c_l,
+                # Positional, so this has to track AtomAttentionEncoder.forward's
+                # order.  Omitting it would shift inplace_safe into wp_tokens and
+                # chunk_size into inplace_safe -- wrong even with fusion off, and
+                # silent.
+                wp_tokens,
                 inplace_safe,
                 chunk_size,
             )
@@ -447,6 +465,7 @@ class DiffusionModule(nn.Module):
                 z=z_pair,
                 p_lm=p_lm,
                 c_l=c_l,
+                wp_tokens=wp_tokens,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )

@@ -610,6 +610,19 @@ class AtomAttentionEncoder(nn.Module):
         n_queries (int, optional): local window size of query tensor. Defaults to 32.
         n_keys (int, optional): local window size of key tensor. Defaults to 128.
         blocks_per_ckpt (int, optional): number of AtomAttentionEncoder/AtomTransformer blocks in each activation checkpoint. Defaults to None.
+        wp_token_dim (int, optional): width of WorldParticle's per-particle
+            tokens `h`.  None, the default, leaves this module byte-identical to
+            upstream -- no parameters are created and `forward` ignores
+            `wp_tokens`.
+
+            A constructor flag rather than a runtime condition, because this
+            class is instantiated twice: once in diffusion.py for the trainable
+            diffusion head, which is the fusion target, and once in embedders.py
+            inside InputFeatureEmbedder, which belongs to the frozen trunk.
+            Deciding inside `forward` -- on `r_l is not None`, say -- would
+            happen to separate the two today while expressing something else
+            ("are there trunk embeddings"), and would silently start fusing into
+            the frozen trunk the moment that coincidence broke.
     """
 
     def __init__(
@@ -625,6 +638,7 @@ class AtomAttentionEncoder(nn.Module):
         n_queries: int = 32,
         n_keys: int = 128,
         blocks_per_ckpt: Optional[int] = None,
+        wp_token_dim: Optional[int] = None,
     ) -> None:
         super(AtomAttentionEncoder, self).__init__()
         self.has_coords = has_coords
@@ -636,6 +650,7 @@ class AtomAttentionEncoder(nn.Module):
         self.n_queries = n_queries
         self.n_keys = n_keys
         self.local_attention_method = "local_cross_attention"
+
 
         self.input_feature = {
             # "ref_pos": 3,
@@ -724,6 +739,32 @@ class AtomAttentionEncoder(nn.Module):
         self.linear_no_bias_q = LinearNoBias(
             in_features=self.c_atom, out_features=self.c_token
         )
+
+        # Kineidos (P004 section 2): condition c_l on WorldParticle's
+        # per-particle tokens.  Nothing is created when wp_token_dim is None, so
+        # the frozen trunk's instance keeps exactly upstream's parameter set and
+        # a checkpoint still loads with strict=True.
+        #
+        # Created last, deliberately.  Constructing a Linear draws from the
+        # global RNG, so building these earlier would shift every shared
+        # parameter created after them: two models differing only in
+        # wp_token_dim would then differ in *all* their weights, and the step-0
+        # comparison against unmodified Protenix would fail for a reason that
+        # has nothing to do with the fusion.  That is exactly what happened the
+        # first time this was written.
+        self.wp_token_dim = wp_token_dim
+        if wp_token_dim is not None:
+            # h is 768 unnormalised channels and its scale has no reason to
+            # match c_l's.  With W_h starting at zero the gradient is
+            # dL/dW_h = dL/dc_l' . h^T, directly proportional to h's scale, so
+            # an unnormalised h would give W_h an enormous first step the moment
+            # it leaves zero.  Standard affine LayerNorm: gamma=1, beta=0 at
+            # init, which leaves the zero-init property intact.
+            self.wp_layernorm = LayerNorm(wp_token_dim)
+            self.wp_fusion = LinearNoBias(
+                in_features=c_atom + wp_token_dim, out_features=c_atom
+            )
+            self._init_wp_fusion()
 
     def prepare_cache(
         self,
@@ -817,6 +858,69 @@ class AtomAttentionEncoder(nn.Module):
             )  # [..., N_sample, n_blocks, n_queries, n_keys, c_atompair]
         return p_lm, c_l
 
+
+    def _init_wp_fusion(self) -> None:
+        """Block-initialise the fusion Linear so step 0 reproduces upstream.
+
+        nn.Linear holds weight as [out, in] and computes x @ W.T, so the input
+        halves are columns: the first c_atom are c_l, the rest are h.  Identity
+        on the c_l half and zero on the h half makes c_l' identically c_l at
+        initialisation, so the modified model is bit-for-bit the unmodified one
+        until training moves the weights.
+
+        Not a multiplicative gate.  v0.1 used output = proj(pooled) * tanh(g)
+        with g at zero, and after 5500 steps |tanh(g)| was still 3e-3: with g
+        near zero the WorldParticle encoder receives no gradient, while g's own
+        gradient depends on proj(pooled) being informative, which it is not
+        while the encoder is untrained -- a deadlock. Here
+        dL/dW_h = dL/dc_l' . h^T is non-zero from the first step, so W_h starts
+        moving immediately and h gets gradient thereafter.  Same structure as a
+        ControlNet zero-conv.
+        """
+        with torch.no_grad():
+            self.wp_fusion.weight.zero_()
+            self.wp_fusion.weight[:, : self.c_atom] = torch.eye(
+                self.c_atom, dtype=self.wp_fusion.weight.dtype
+            )
+
+    def _fuse_wp_tokens(
+        self, c_l: torch.Tensor, wp_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """c_l' = Linear([c_l ; LayerNorm(h)]).
+
+        `h` carries no N_sample dependence: the window is canonicalised before
+        WorldParticle sees it (plan section 2.9.3), which makes h pose-free,
+        while N_sample differs only in pose.  So it broadcasts across that axis
+        instead of being recomputed per sample.
+
+        The shapes are checked rather than broadcast implicitly -- h is
+        concatenated onto c_l position by position, and a silent broadcast over
+        the atom axis would train a model nobody could explain.
+        """
+        # Contract first, arithmetic second.  LayerNorm raises its own shape
+        # error on a wrong width, and that message says nothing about why the
+        # widths have to agree -- the caller needs to be told what the contract
+        # is, not which tensor op noticed it was broken.
+        if wp_tokens.shape[-1] != self.wp_token_dim:
+            raise ValueError(
+                f"wp_tokens is {wp_tokens.shape[-1]} wide but this encoder was "
+                f"built for {self.wp_token_dim}; the width is "
+                f"cconv_embedding_dim x factor, 384 x 2 = 768 without an "
+                f"obstacle branch"
+            )
+        if wp_tokens.shape[-2] != c_l.shape[-2]:
+            raise ValueError(
+                f"WorldParticle gave {wp_tokens.shape[-2]} tokens but c_l has "
+                f"{c_l.shape[-2]} atoms; these are concatenated position by "
+                f"position and must be the same atom set in the same order"
+            )
+
+        h = self.wp_layernorm(wp_tokens)
+        if h.dim() == c_l.dim() - 1:
+            h = h.unsqueeze(dim=-3)
+        h = h.expand(*c_l.shape[:-1], h.shape[-1])
+        return self.wp_fusion(torch.cat([c_l, h], dim=-1))
+
     def forward(
         self,
         atom_to_token_idx: torch.Tensor,
@@ -833,6 +937,7 @@ class AtomAttentionEncoder(nn.Module):
         z: torch.Tensor = None,
         p_lm: torch.Tensor = None,
         c_l: torch.Tensor = None,
+        wp_tokens: torch.Tensor = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -903,6 +1008,12 @@ class AtomAttentionEncoder(nn.Module):
                 x_token=self.linear_no_bias_s(self.layernorm_s(s)),
                 atom_to_token_idx=atom_to_token_idx,
             )  # [..., N_sample, N_atom, c_atom]
+
+            # Kineidos: condition on WorldParticle's per-particle tokens, here
+            # rather than later so that both q_l below and the pair update that
+            # follows see the fused c_l.
+            if self.wp_token_dim is not None and wp_tokens is not None:
+                c_l = self._fuse_wp_tokens(c_l, wp_tokens)
 
             # Add the noisy positions
             # Different from paper!!
