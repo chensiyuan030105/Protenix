@@ -71,6 +71,18 @@ class Window:
     anchor_rmsd_to_ref_nm: float
     inter_frame_rotation_deg: float
 
+    # The reference conformer in nanometres, and whether this window was put
+    # into canonical pose against it.  Both are here for the bridge, which has
+    # to verify that nothing transformed the window after the dataloader --
+    # canonicalisation is idempotent, so re-aligning a canonical window must
+    # leave it where it is, and any drift means something moved it.
+    #
+    # features["ref_pos"] cannot serve: the featurizer centres it per residue
+    # (featurizer.py:403-413 through random_transform), so it is not the
+    # conformer in global coordinates and Kabsch against it is meaningless.
+    ref_pos_nm: torch.Tensor        # [N, 3]
+    canonicalized: bool
+
     features: dict[str, torch.Tensor]        # Protenix, Angstroms
     labels: dict[str, torch.Tensor]          # Protenix, Angstroms
 
@@ -206,6 +218,8 @@ def build_window(
         wp_frame_mask=torch.from_numpy(valid.copy()),
         anchor_rmsd_to_ref_nm=float(info["anchor_rmsd_to_ref"]),
         inter_frame_rotation_deg=float(turn),
+        ref_pos_nm=torch.from_numpy(sample.ref_pos_nm().copy()).float(),
+        canonicalized=bool(canonicalize),
         features=features,
         labels=labels,
     )

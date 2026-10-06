@@ -140,6 +140,59 @@ def main() -> int:
     check("velocities canonicalise with the positions", vdrift < 1e-4,
           f"max |diff| {vdrift:.3e} nm/ps")
 
+    print("\n=== 6a. the window carries what the bridge needs ===")
+    # P004.4's wp_bridge has to be able to re-canonicalise in order to check
+    # that nobody transformed the window after the dataloader.  That needs the
+    # reference conformer in global nanometres -- features["ref_pos"] is centred
+    # per residue and cannot be used -- and a record of whether this window was
+    # canonicalised at all, since build_window(canonicalize=False) is a
+    # legitimate call and must not trip the check.
+    check("ref_pos_nm is the reference conformer, not the centred ref_pos",
+          tuple(w.ref_pos_nm.shape) == (470, 3)
+          and float((w.ref_pos_nm.double().numpy()
+                     - sample.ref_pos_nm()).__abs__().max()) < 1e-5,
+          f"shape {tuple(w.ref_pos_nm.shape)}")
+    check("canonicalized flag is set", w.canonicalized is True)
+    raw = build_window(sample, target_frame=5000, stride=100, k=8,
+                       canonicalize=False)
+    check("and false when canonicalisation was skipped",
+          raw.canonicalized is False)
+    # The property the bridge will assert, verified here on both: a canonical
+    # window re-aligns to itself; a raw one generally does not.
+    from kineidos.window_align import canonicalize_window
+    def drift(win):
+        pos = win.wp_position_nm.double().numpy()
+        again, _, _ = canonicalize_window(pos, None, win.ref_pos_nm.double().numpy())
+        return float(np.abs(again - pos).max())
+    d_canon, d_raw = drift(w), drift(raw)
+    check("re-aligning a canonical window moves nothing", d_canon < 1e-4,
+          f"{d_canon:.3e} nm")
+
+    # What the check is for, demonstrated on the failure it actually guards
+    # against: a rigid transform applied after the dataloader.  That is what
+    # would happen if someone extended Protenix's augmentation to the
+    # WorldParticle window, and it moves atoms by nanometres.
+    g2 = np.random.default_rng(11)
+    q2, r2 = np.linalg.qr(g2.normal(size=(3, 3)))
+    q2 *= np.sign(np.diag(r2))
+    if np.linalg.det(q2) < 0:
+        q2[:, 0] *= -1
+    meddled = type(w)(**{**w.__dict__,
+                         "wp_position_nm": (w.wp_position_nm.double().numpy()
+                                            @ q2.T).astype("float32")})
+    meddled.wp_position_nm = torch.from_numpy(
+        w.wp_position_nm.double().numpy() @ q2.T).float()
+    d_bad = drift(meddled)
+    check("a transform applied after the dataloader is far above tolerance",
+          d_bad > 1e-2, f"{d_bad:.3e} nm against a 1e-4 limit")
+
+    # And what the check cannot distinguish, which is fine: GAGU arrives
+    # RMSD-fitted, so an un-canonicalised window is already nearly canonical.
+    # The guard is not a test of whether canonicalisation ran.
+    print(f"  (skipping canonicalisation shifts GAGU by only {d_raw:.3e} nm, "
+          f"because the trajectories are pre-fitted -- the guard is for "
+          f"post-hoc transforms, not for this)")
+
     print("\n=== 6b. the tumbling guard fires on an unfitted window ===")
     # Rotate each frame of the trajectory by a growing angle, which is what an
     # unfitted trajectory looks like, and confirm build_window refuses it rather
