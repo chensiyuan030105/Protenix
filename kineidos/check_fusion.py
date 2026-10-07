@@ -12,7 +12,7 @@ regression here is a change in behaviour, and only a side-by-side run can say
 so.
 
 Usage (from the workspace root):
-    PYTHONPATH=repos/research/kineidos-v2:repos/research/wp-v2 \
+    PYTHONPATH=repos/research/kineidos-v3:repos/research/wp-v2 \
     LAYERNORM_TYPE=torch ATTN_IMPL=sdpa \
     LD_LIBRARY_PATH=/mnt/xfs/home/mhg/anaconda3/envs/kineidos-v2-slurm/lib \
       .../envs/kineidos-v2-slurm/bin/python -m kineidos.check_fusion

@@ -45,7 +45,19 @@ import torch
 from kineidos.window_align import canonicalize_window, inter_frame_rotation_deg
 
 DT_MIN_NS = 0.1
-DT_MAX_NS = 100.0
+# The upper end is a memory time, not a data-availability figure.  P004 used
+# 100 ns because the trajectories could supply it; measured afterwards on GAGU
+# (tau_half = 0.35 ns, kineidos.measure_decorrelation) that range leaves the
+# history at most 5.7% of the no-history error to remove, against a measurement
+# floor of 0.31-1.70% -- signal and noise at one magnitude, which is why P004's
+# three arms read the same.  1 ns is 2.9 tau_half, the same place STAR-MD's
+# upper end sits on its proteins (2.2), and rounding dt to an integer stride
+# puts the expected available information at 15.2%.  P009 sections 2.1-2.4.
+#
+# Both datasets are built from these defaults, so this one constant moves the
+# training windows and the held-out windows together.  A range set per dataset
+# would make the held-out loss measure a different problem than the one trained.
+DT_MAX_NS = 1.0
 
 
 @dataclass

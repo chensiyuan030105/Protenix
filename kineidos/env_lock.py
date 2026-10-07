@@ -8,7 +8,7 @@ later, leaving an older command string meaning something different.  This file
 closes that gap by recording the contents, not just the names.
 
 Usage (from the workspace root):
-    PYTHONPATH=repos/research/kineidos-v2:repos/research/wp-v2 \
+    PYTHONPATH=repos/research/kineidos-v3:repos/research/wp-v2 \
     LAYERNORM_TYPE=torch ATTN_IMPL=sdpa \
     LD_LIBRARY_PATH=/mnt/xfs/home/mhg/anaconda3/envs/kineidos-v2-slurm/lib \
       .../envs/kineidos-v2-slurm/bin/python -m kineidos.env_lock runs/<run_id>
@@ -69,6 +69,41 @@ def _run(cmd: list[str], cwd: str | None = None) -> str | None:
     return out.stdout.strip() if out.returncode == 0 else None
 
 
+def _code_trees(workspace: Path) -> dict[str, object]:
+    """The code trees this process imports from, derived rather than named.
+
+    This used to list repos/research/kineidos-v2 literally.  P009 moved the work
+    to a v3 worktree, and the hardcoded version would have recorded v2's commit
+    -- which is frozen at tag p009-base, the very commit P009 section 6.1's
+    first condition compares the diff against.  The lock would have read exactly
+    right while describing code that was not running.  Nothing would have
+    noticed, because a plausible commit is indistinguishable from the correct
+    one once it is written down.
+
+    Derived from PYTHONPATH, which is what the command declared, and cross-
+    checked against where `import kineidos` actually resolved: an editable
+    install or a stale sys.path entry makes those two disagree, and that
+    disagreement is the failure AGENTS.md's PYTHONPATH section exists for.
+    """
+    import kineidos
+
+    resolved = Path(kineidos.__file__).resolve().parent.parent
+    declared = []
+    for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        path = Path(entry)
+        declared.append((path if path.is_absolute() else workspace / path).resolve())
+
+    trees: dict[str, object] = {}
+    for path in declared + ([resolved] if resolved not in declared else []):
+        record = _worktree(path)
+        record["declared_on_pythonpath"] = path in declared
+        record["imports_resolve_here"] = path == resolved
+        trees[path.name] = record
+    return trees
+
+
 def _worktree(path: Path) -> dict[str, object]:
     """Commit and dirtiness of one worktree.  A dirty tree is recorded, not
     rejected: refusing to run would be the wrong trade during development, but
@@ -120,10 +155,7 @@ def collect(workspace: Path) -> dict[str, object]:
             "source": "conda-forge libegl 1.7.0 ha4b6fd6_5, copied from envs/mfm/lib on 2026-10-06",
             "sha256": libs,
         },
-        "worktrees": {
-            "kineidos-v2": _worktree(workspace / "repos/research/kineidos-v2"),
-            "wp-v2": _worktree(workspace / "repos/research/wp-v2"),
-        },
+        "worktrees": _code_trees(workspace),
         "pip_freeze": (_run([sys.executable, "-m", "pip", "freeze"]) or "").splitlines(),
     }
 

@@ -19,7 +19,7 @@ not announce itself:
 Exit code is 0 only if every check passes.
 
 Usage (from the workspace root):
-    PYTHONPATH=repos/research/kineidos-v2:repos/research/wp-v2 \
+    PYTHONPATH=repos/research/kineidos-v3:repos/research/wp-v2 \
     LAYERNORM_TYPE=torch ATTN_IMPL=sdpa \
     LD_LIBRARY_PATH=/mnt/xfs/home/mhg/anaconda3/envs/kineidos-v2-slurm/lib \
       .../envs/kineidos-v2-slurm/bin/python -m kineidos.check_env
@@ -28,6 +28,7 @@ PROTENIX_CKPT overrides the checkpoint path.
 """
 import os, sys, re
 from collections.abc import Mapping
+from pathlib import Path
 
 FAILS = []
 def check(name, cond, detail=""):
@@ -51,7 +52,17 @@ print("\n=== 2. 代码来源落在 repos/research/ ===")
 import protenix
 import models.super_particle_layers as spl
 import TrajDataset
-check("protenix -> kineidos-v2", "/repos/research/kineidos-v2/" in protenix.__file__, protenix.__file__)
+# Not a fixed worktree name: this read "kineidos-v2" until P009 moved the work
+# to v3, at which point the check would have failed on a correct environment and
+# the obvious repair would have been to edit the name again.  What has to hold is
+# that protenix and kineidos come out of the *same* tree -- one of them resolving
+# elsewhere is how the editable install of 2026-10-05 went unnoticed -- and that
+# the tree is one of ours under repos/research/.
+import kineidos
+tree = Path(kineidos.__file__).resolve().parent.parent
+check("protenix 与 kineidos 同一棵树", Path(protenix.__file__).resolve().is_relative_to(tree),
+      f"{protenix.__file__} vs {tree}")
+check("该树在 repos/research/ 下", "/repos/research/" in str(tree), str(tree))
 check("WP models -> wp-v2", "/repos/research/wp-v2/" in spl.__file__, spl.__file__)
 
 print("\n=== 3. 重命名后的名字 ===")

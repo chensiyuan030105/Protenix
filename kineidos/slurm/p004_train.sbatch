@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# P004: Protenix diffusion head + WorldParticle injection, AF3 trunk frozen.
+# P004/P009: Protenix diffusion head + WorldParticle injection, trunk frozen.
+#
+# Written for P004 and kept at this path because P009 section 4 cites it by
+# name.  Under P009 it drives the v3 protocol: dt in [0.1, 1] ns (the constant
+# lives in kineidos/data/windows.py), 256 held-out windows, 10000 steps, and
+# runs/p009 for the output.  Everything about the fusion, the freezing and the
+# four arms is P004's and unchanged.
 #
 # DDP via torchrun.  runner/train.py builds DDP with static_graph=True, which
 # requires the same parameters to participate every iteration.  That turned out
@@ -17,9 +23,15 @@
 # time, only to match.
 #
 #   sbatch --gres=gpu:a100:3 --cpus-per-task=12 --mem=160G \
+#          --nodelist=deep-chungus-7 \
 #          --export=ALL,WP_MODE=zero,NGPU=3 \
 #          kineidos/slurm/p004_train.sbatch
-#SBATCH --job-name=p004-kineidos
+#
+# The fourth P009 arm is the noise floor: the same WP_MODE=zero with a different
+# training seed, which is a different 10,000 windows as well as different
+# initialisation.  Give it its own RUN_NAME or it resumes into the first one:
+#   --export=ALL,WP_MODE=zero,NGPU=3,SEED=43,RUN_NAME=p009_zero_seed2
+#SBATCH --job-name=p009-kineidos
 # background on the A100 nodes, with --requeue and a resume path.
 #
 # Not h100: those GPUs are broken.  deep-h-1 is drained with reason
@@ -70,23 +82,32 @@ CHECKPOINT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/run
 
 WP_MODE="${WP_MODE:?set WP_MODE to none, zero, random or pretrained}"
 NGPU="${NGPU:-1}"
-RUN_NAME="${RUN_NAME:-p004_${WP_MODE}}"
-MAX_STEPS="${MAX_STEPS:-100000}"
+RUN_NAME="${RUN_NAME:-p009_${WP_MODE}}"
+# Explicit and identical across arms.  P004's three arms stopped at different
+# step counts, which left exactly two checkpoints that could be compared across
+# arms; at ~6.5 s a step, 10000 steps is about 18 hours (P009 section 4, item 4).
+MAX_STEPS="${MAX_STEPS:-10000}"
 SEED="${SEED:-42}"
 # Disk arithmetic, because /mnt/xfs sits at 97% (AGENTS.md).  save_checkpoint
 # writes the whole 368.60M state_dict plus Adam's two moments for the 203.37M
 # trainable parameters -- about 3.1 GB a file -- and the frozen trunk in every
 # one of them is a byte-for-byte copy of the pretrained checkpoint.  Upstream's
 # saver is left alone because resumability is worth more than the space here,
-# but the interval is what bounds the cost: at 500 and MAX_STEPS=2000 that is
-# five files, ~16 GB per arm, ~47 GB for none/zero/random.  Raise the interval
-# before raising MAX_STEPS.
-CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-2000}"
-# Held-out scoring runs inside training.  64 windows is a compromise: enough to
-# average over the noise level and the augmentation rotation, few enough that a
-# round costs well under a percent of the interval it covers.
+# but the interval is what bounds the cost: at 1000 and MAX_STEPS=10000 that is
+# ten files, ~31 GB per arm, ~124 GB for the four P009 arms, plus one latest.pt
+# per arm in RESUME_DIR.  Checked against df before submitting: 3.9 TB free of
+# 112 TB on 2026-10-07, so this fits -- but /mnt/xfs sits at 97% and the margin
+# is the cluster's, not ours.
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-1000}"
+# Held-out scoring runs inside training.  P004 used 64 windows -- enough for a
+# mean, not enough to split.  P009 reads the result in three dt bins (stride
+# 1-2, 3-5, 6-10) and asks for at least 50 windows in each, and the log-uniform
+# draw puts only 2.2% of windows at stride 10, so 256 is the smallest round
+# number that fills the thin bin: about 102 / 88 / 66 by section 2.4's weights.
+# Four times P004's eval cost, still far below the 500 training steps it covers.
+# The config default stays 64; this is passed through --kineidos.eval_windows.
 EVAL_INTERVAL="${EVAL_INTERVAL:-500}"
-EVAL_WINDOWS="${EVAL_WINDOWS:-64}"
+EVAL_WINDOWS="${EVAL_WINDOWS:-256}"
 
 # Train / held-out split.  The 64 GAGU trajectories are a balanced
 # 2 salt x 4 sequence x 2 start x 4 replicate design, so the split can be made
@@ -104,13 +125,17 @@ N_HELD=$(echo "${HELD_OUT}" | tr ',' '\n' | grep -c .)
 # Per-arm, and stable across requeues -- init_basics appends a timestamp to the
 # run directory, so a requeued job cannot find its predecessor's checkpoints by
 # any name it can derive itself.
-RESUME_DIR="${RESUME_DIR:-${WORKSPACE}/runs/p004/${RUN_NAME}_resume}"
+RESUME_DIR="${RESUME_DIR:-${WORKSPACE}/runs/p009/${RUN_NAME}_resume}"
 
-mkdir -p "${WORKSPACE}/runs/slurm" "${WORKSPACE}/runs/p004" "${RESUME_DIR}"
+mkdir -p "${WORKSPACE}/runs/slurm" "${WORKSPACE}/runs/p009" "${RESUME_DIR}"
 cd "${WORKSPACE}"
 
 # Every one of these is load-bearing; see AGENTS.md's "Python 环境与 PYTHONPATH".
-export PYTHONPATH="repos/research/kineidos-v2:repos/research/wp-v2"
+# v3, not v2: P009 changes the protocol, so it gets the version number and v2
+# stays equal to "the code P004 ran" (P009 section 3).  env.lock records which
+# tree the import actually resolved to, so a stale value here is caught rather
+# than inherited.
+export PYTHONPATH="repos/research/kineidos-v3:repos/research/wp-v2"
 export PYTHONUNBUFFERED=1
 # Prepend, do not replace.  AGENTS.md documents the replacing form, which works
 # on the login node only because libcuda is not needed there; on a GPU node it
@@ -175,9 +200,9 @@ fi
 exec "${LAUNCH[@]}" -m kineidos.train.main \
   --wp.mode "${WP_MODE}" \
   --load_checkpoint_path "${CHECKPOINT}" \
-  --project p004 \
+  --project p009 \
   --run_name "${RUN_NAME}" \
-  --base_dir "${WORKSPACE}/runs/p004" \
+  --base_dir "${WORKSPACE}/runs/p009" \
   --max_steps "${MAX_STEPS}" \
   --seed "${SEED}" \
   --log_interval 50 \

@@ -1,6 +1,8 @@
-"""The P004 trainer: Protenix's loop, with the trunk frozen and WP injected.
+"""The Kineidos trainer: Protenix's loop, with the trunk frozen and WP injected.
 
-A subclass rather than a fork of runner/train.py.  Four things differ, and
+Built for P004; carried into P009 unchanged except for `write_heldout_rows`.
+
+A subclass rather than a fork of runner/train.py.  Five things differ, and
 each of them is a place where getting it wrong is silent:
 
 - **init_data** reads GAGU windows instead of mmCIF, through our collate.
@@ -12,7 +14,10 @@ each of them is a place where getting it wrong is silent:
   load_strict straight to load_state_dict.
 - **train_step** records the injection-strength observables alongside the
   losses, so a run that is not actually injecting says so while it runs rather
-  than when someone reads the checkpoint afterwards (plan section 5).
+  than when someone reads the checkpoint afterwards (P004 section 5).
+- **write_heldout_rows** keeps the per-window held-out losses, which the mean
+  alone cannot substitute for: on this data the difficulty is set by dt, so a
+  difference between arms lives inside a dt bin (P009 section 4, item 6).
 
 Evaluation is deliberately not the inference path; see `evaluate`.
 """
@@ -400,7 +405,8 @@ class KineidosTrainer(AF3Trainer):
         shard = self.eval_windows[DIST_WRAPPER.rank::DIST_WRAPPER.world_size]
         totals: dict[str, float] = {}
         n = 0
-        for window in shard:
+        rows: list[dict[str, Any]] = []
+        for i, window in enumerate(shard):
             batch = to_device(collate_window(window), self.device)
             pred, label, _ = self.raw_model(
                 input_feature_dict=batch["input_feature_dict"],
@@ -419,16 +425,32 @@ class KineidosTrainer(AF3Trainer):
                 # the number should describe.
                 n_cycle=self.configs.model.N_cycle,
             )
-            _, loss_dict = self.loss(
+            total, loss_dict = self.loss(
                 feat_dict=batch["input_feature_dict"],
                 pred_dict=pred,
                 label_dict=label,
                 mode="train",
             )
-            for key, value in loss_dict.items():
-                if "loss" not in key:
-                    continue
-                totals[key] = totals.get(key, 0.0) + float(value)
+            per_window = {k: float(v) for k, v in loss_dict.items()
+                          if "loss" in k}
+            for key, value in per_window.items():
+                totals[key] = totals.get(key, 0.0) + value
+            rows.append({
+                # The index into the fixed set, not the position in this rank's
+                # shard.  The shard is eval_windows[rank::world_size], so rank
+                # r's i-th window is global r + i*world_size; numbering by i
+                # alone would give three different windows the same id and the
+                # per-dt bins would be built from a scrambled set.
+                "window_id": DIST_WRAPPER.rank + i * DIST_WRAPPER.world_size,
+                "sample_id": window.sample_id,
+                "target_frame": int(window.target_frame),
+                "stride": int(window.stride),
+                "delta_t_ns": float(window.delta_t_ns),
+                **per_window,
+                # Last, so it is the total that backward would have used rather
+                # than whatever the loss happens to call "loss" in its dict.
+                "loss": float(total),
+            })
             n += 1
 
         if DIST_WRAPPER.world_size > 1:
@@ -442,6 +464,11 @@ class KineidosTrainer(AF3Trainer):
             dist.all_reduce(packed, op=dist.ReduceOp.SUM)
             totals = {k: packed[i].item() for i, k in enumerate(keys)}
             n = int(packed[-1].item())
+
+        # rows survives the reduction above -- it reduces `totals`, not the
+        # per-window values -- but those values exist nowhere else, so they go
+        # to disk before anything else can be reported.
+        self.write_heldout_rows(rows)
 
         means = {k: v / n for k, v in totals.items()}
         for key, value in means.items():
@@ -464,3 +491,32 @@ class KineidosTrainer(AF3Trainer):
 
         if was_training:
             self.raw_model.train()
+
+    def write_heldout_rows(self, rows: list[dict[str, Any]]) -> None:
+        """One line per held-out window, per rank, per evaluation round.
+
+        The mean cannot answer the question P009 asks.  Difficulty on this data
+        is almost entirely set by dt -- the history can remove 27.8% of the
+        no-history error at 0.1 ns and 5.2% at 1.0 ns (P009 section 1.1) -- so
+        an arm-to-arm difference lives inside a dt bin and is diluted by the
+        windows where no history could have helped.  Averaged over the set, a
+        real effect in the short-dt windows and no effect at all are the same
+        number.  P004 section 2.17 named this gap; filling it costs the lines
+        below, and the all_reduce after the scoring loop is where these values
+        used to disappear.
+
+        Per rank, not gathered.  all_gather_object on 256 rows every 500 steps
+        buys nothing, and separate files cannot interleave.  The reader joins
+        them: the window_id is global, so `cat step_<N>.rank*.jsonl` is the
+        whole set exactly once.
+        """
+        import json
+
+        out = Path(self.run_dir) / "heldout"
+        # exist_ok because init_basics creates run_dir on rank 0 only, and every
+        # rank writes here.
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"step_{self.step}.rank{DIST_WRAPPER.rank}.jsonl"
+        with open(path, "w") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")

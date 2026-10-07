@@ -10,7 +10,7 @@ building the baseline architecture under an ablation arm's name.
 
 Run from the workspace root (AGENTS.md):
 
-    PYTHONPATH=repos/research/kineidos-v2:repos/research/wp-v2 \\
+    PYTHONPATH=repos/research/kineidos-v3:repos/research/wp-v2 \\
     LAYERNORM_TYPE=torch ATTN_IMPL=sdpa LD_LIBRARY_PATH=$ENV/lib \\
       $ENV/bin/python -m kineidos.train.main --wp.mode random ...
 """

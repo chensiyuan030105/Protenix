@@ -38,7 +38,7 @@ trajectory has not finished mixing and the plateau is the stricter reference.
 
 Run from the workspace root:
 
-    PYTHONPATH=repos/research/kineidos-v2:repos/research/wp-v2 \
+    PYTHONPATH=repos/research/kineidos-v3:repos/research/wp-v2 \
     LAYERNORM_TYPE=torch ATTN_IMPL=sdpa \
       <env>/bin/python -m kineidos.measure_decorrelation --out artifacts/reports/P009
 """

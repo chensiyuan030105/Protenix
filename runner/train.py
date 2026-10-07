@@ -610,7 +610,7 @@ class AF3Trainer(object):
         )
 
         with enable_amp:
-            batch, _ = self.model_forward(batch, mode="train")
+            batch, log_dict = self.model_forward(batch, mode="train")
             loss, loss_dict, _ = self.get_loss(batch, mode="train")
 
         if self.configs.dtype in ["bf16", "fp32"]:
@@ -635,6 +635,28 @@ class AF3Trainer(object):
             if "loss" not in key:
                 continue
             self.train_metric_wrapper.add(key, value, namespace="train")
+        # The permutation entries out of model_forward, which this used to drop
+        # on the floor.  Not bookkeeping: GAGU's two chains carry the same
+        # sequence, so chain permutation is live, while the two chains are not
+        # conformationally equivalent and the history h is per-atom.  A permuted
+        # label means the model was handed chain A's history and scored against
+        # chain B's coordinates -- the one error a history-conditioned model
+        # cannot absorb, and the reason P009 section 8.4 wants the rate before
+        # deciding whether to turn symmetric_permutation off.  It has to be
+        # visible while the run runs, so it goes through the same aggregator as
+        # the losses and lands in the periodic metrics line.
+        for key, value in log_dict.items():
+            if "perm" not in key:
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                value = value.item()
+            try:
+                scalar = float(value)
+            except (TypeError, ValueError):
+                continue
+            self.train_metric_wrapper.add(key, scalar, namespace="train")
         torch.cuda.empty_cache()
 
     def progress_bar(self, desc: str = "") -> None:
