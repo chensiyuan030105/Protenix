@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
+from protenix.utils.distributed import DIST_WRAPPER
+
 from kineidos import observables
+from kineidos.seeding import set_all_seeds
 from kineidos.checkpoint import FUSION_KEYS, load_checkpoint
 from kineidos.train.batch import collate_fn_window
 from kineidos.train.freezing import format_report, freeze_trunk
@@ -155,7 +158,7 @@ class KineidosTrainer(AF3Trainer):
 
         cfg = self.configs.kineidos
         root = Path(cfg.gagu_root)
-        names = list(cfg.train_samples)
+        names = [n for n in cfg.train_samples if n]
         if not names:
             raise ValueError(
                 "kineidos.train_samples is empty; name the GAGU trajectories to "
@@ -181,6 +184,22 @@ class KineidosTrainer(AF3Trainer):
                 dataset, num_replicas=DIST_WRAPPER.world_size,
                 rank=DIST_WRAPPER.rank, shuffle=False, drop_last=False,
             )
+        # ListValue's default is [""]; an empty name is "no held-out set", not a
+        # trajectory called "".
+        held = [n for n in cfg.held_out_samples if n]
+        self.eval_windows = None
+        if held:
+            self.print(f"Held out {len(held)} GAGU samples")
+            eval_samples = [GAGUProtenixAdapter(root / n).load() for n in held]
+            # A fixed set, iterated in order, with its own seed.  Fixed is the
+            # whole point: the number only means something if every arm, and
+            # every evaluation round, scores the same windows.
+            eval_ds = GAGUWindowDataset(
+                eval_samples, k=cfg.window_k, length=cfg.eval_windows,
+                seed=cfg.eval_seed, canonicalize=True,
+            )
+            self.eval_windows = [eval_ds[i] for i in range(len(eval_ds))]
+
         self.train_dl = torch.utils.data.DataLoader(
             dataset,
             batch_size=1,          # the loss calls feat_dict["resolution"].item()
@@ -194,14 +213,97 @@ class KineidosTrainer(AF3Trainer):
 
     # -------------------------------------------------------- checkpoint
 
-    def try_load_checkpoint(self) -> None:
-        """Load the pretrained trunk, allowing exactly the fusion to be absent.
+    def latest_link(self) -> Optional[Path]:
+        """The stable path a requeued job looks for, or None if not configured.
 
-        Upstream hands `load_strict` to load_state_dict.  Either value is wrong
-        here: True raises because the fusion's three parameters are new, and
-        False would equally tolerate a renamed module quietly not loading.
-        kineidos/checkpoint.py asks for equality instead.
+        A requeued job gets a fresh run directory -- init_basics appends a
+        timestamp -- so it cannot find its predecessor's checkpoints by
+        construction.  This is the fixed point that survives the rename.
         """
+        if not self.configs.kineidos.resume_dir:
+            return None
+        return Path(self.configs.kineidos.resume_dir) / "latest.pt"
+
+    def save_checkpoint(self, ema_suffix: str = "") -> None:
+        """Save as upstream does, then point `latest.pt` at it.
+
+        The arm goes into the file as well.  Resuming a `zero` checkpoint into a
+        `random` model would load cleanly for every shared key and leave the
+        bridge at its initialisation, producing a run that is neither arm and
+        says nothing about it -- so it is refused on the way back in.
+        """
+        super().save_checkpoint(ema_suffix=ema_suffix)
+        link = self.latest_link()
+        if link is None or DIST_WRAPPER.rank != 0 or ema_suffix:
+            return
+        saved = Path(self.checkpoint_dir) / f"{self.step}{ema_suffix}.pt"
+        if not saved.exists():
+            return
+        link.parent.mkdir(parents=True, exist_ok=True)
+        # Replace the symlink atomically: a requeue can land between the unlink
+        # and the re-link, and a resume that finds no latest.pt silently starts
+        # the run over.  os.replace on a symlink is one rename syscall.
+        tmp = link.with_name(link.name + ".tmp")
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        tmp.symlink_to(saved.resolve())
+        os.replace(tmp, link)
+        # The arm goes beside the checkpoint rather than inside it: rewriting a
+        # 3 GB file to add one string is not worth it, and a sidecar can be read
+        # without torch.load.
+        (link.parent / "latest.arm").write_text(self.configs.wp.mode + "\n")
+        self.print(f"latest.pt -> {saved}")
+
+    def resume(self, path: Path) -> bool:
+        """Continue a run that was interrupted.  True if it actually resumed.
+
+        Needed because the only partition with working GPUs and free capacity is
+        `background`, which sits at PriorityTier=5 under PreemptMode=REQUEUE
+        with no grace period: a job there is killed and restarted from scratch
+        whenever a tier-10 job wants the node.  Without this, "train for a long
+        time" and "use background" are mutually exclusive.
+        """
+        arm_file = path.parent / "latest.arm"
+        if arm_file.exists():
+            arm = arm_file.read_text().strip()
+            if arm != self.configs.wp.mode:
+                raise ValueError(
+                    f"{path} was written by the {arm!r} arm and this run is "
+                    f"{self.configs.wp.mode!r}. Resuming across arms would load "
+                    f"every shared key and leave the bridge at initialisation, "
+                    f"giving a run that is neither arm. Use a resume_dir per arm."
+                )
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        state = checkpoint["model"]
+        if next(iter(state)).startswith("module."):
+            state = {k[len("module."):]: v for k, v in state.items()}
+        # Nothing may be missing here, unlike the pretrained load: this file was
+        # written by this architecture, so a gap means the architecture changed
+        # under the run and the comparison is void.
+        load_checkpoint(self.raw_model, state, expect_new=())
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        if checkpoint.get("scheduler") is not None:
+            self.lr_scheduler.load_state_dict(checkpoint["scheduler"])
+        self.step = checkpoint["step"] + 1
+        self.start_step = self.step
+        self.global_step = self.step * self.iters_to_accumulate
+        self.print(f"Resumed {self.configs.wp.mode!r} from {path} at step {self.step}")
+        return True
+
+    def try_load_checkpoint(self) -> None:
+        """Resume if there is a run to resume, otherwise load the pretrained trunk.
+
+        For the pretrained load, upstream hands `load_strict` to
+        load_state_dict.  Either value is wrong here: True raises because the
+        fusion's three parameters are new, and False would equally tolerate a
+        renamed module quietly not loading.  kineidos/checkpoint.py asks for
+        equality instead.
+        """
+        link = self.latest_link()
+        if link is not None and (link.exists() or link.is_symlink()):
+            self.resume(link)
+            return
+
         path = self.configs.load_checkpoint_path
         if not path:
             raise ValueError(
@@ -240,31 +342,114 @@ class KineidosTrainer(AF3Trainer):
         for message in observables.warnings(stats, mode=self.configs.wp.mode):
             self.print(f"[injection] step {self.step}: {message}")
 
+    @torch.no_grad()
     def evaluate(self, mode: str = "eval") -> None:
-        """Not implemented -- skipped loudly, not silently, and not fatally.
+        """The training objective on held-out windows, with dropout off.
 
-        Upstream's evaluate runs main_inference_loop and then reads
+        Not upstream's evaluate: that goes through main_inference_loop and reads
         pred_dict["summary_confidence"], which the confidence head produces and
-        this configuration does not run.  So held-out evaluation needs a loop
-        of its own, scoring the *training* objective on unseen windows.  Two
-        decisions have to be made first and neither should be improvised here:
-        whether to accept dropout noise in the metric (Protenix.forward asserts
-        self.training for mode="train", so scoring the training objective with
-        dropout off means relaxing that assert in this fork), and which GAGU
-        trajectories are held out.
+        this configuration does not run.
 
-        This raised NotImplementedError at first, which was wrong: run() calls
-        evaluate() whenever `is_last_step`, regardless of eval_interval, so
-        raising threw away every completed run at its final step.  It prints
-        instead -- once per run with eval_interval=-1 -- because a silent `pass`
-        would let someone read the absence of eval metrics as "they were fine".
+        Three choices make the number comparable across arms, and each of them
+        matters more than it looks:
 
-        Until it exists, the instruments are section 5's observables and the
-        training losses.
+        **Dropout off.**  Not for a cleaner number -- for pairing.  The noise
+        level and the augmentation rotation are drawn inside
+        sample_diffusion_training from the global RNG.  With dropout active the
+        arms consume different amounts of that stream, the draws stop matching,
+        and the comparison quietly becomes unpaired.  With dropout off and the
+        same seed, every arm sees bit-identical noise and rotations, so the only
+        thing that differs between arms is the thing under test.  This is why
+        Protenix.forward gained eval_training_objective.
+
+        **A fixed window set.**  Drawn once in init_data from the held-out
+        trajectories with its own seed, and scored in the same order every time.
+
+        **The seed reset per round.**  Reset before the loop so that round k
+        scores the same noise as round k of any other arm, which makes the
+        curves comparable point by point rather than only in trend.
+
+        The loss is Protenix's own, so the rigid alignment inside MSELoss and
+        SmoothLDDTLoss is the one the training objective uses -- writing a second
+        alignment here is how a metric ends up measuring something else (8).
         """
-        self.print(
-            f"[eval] skipped at step {self.step}: held-out evaluation is not "
-            f"implemented for P004. Upstream's evaluate needs the confidence "
-            f"head that skip_confidence removes; this run's instruments are the "
-            f"training losses and the train/wp/ observables."
-        )
+        if not self.eval_windows:
+            self.print(
+                f"[eval] step {self.step}: no held-out windows configured "
+                f"(kineidos.held_out_samples is empty), nothing to score"
+            )
+            return
+
+        from protenix.utils.torch_utils import to_device
+
+        from kineidos.train.batch import collate_window
+
+        # raw_model, not the DDP wrapper.  Scoring needs no gradient sync, and
+        # going through DDP would entangle an eval forward with static_graph's
+        # one-shot graph construction for no benefit.
+        was_training = self.raw_model.training
+        self.raw_model.eval()
+        # Reset per round, not once per run: round k must score the same noise
+        # as round k of every other arm.
+        set_all_seeds(self.configs.kineidos.eval_seed)
+
+        # Shard the fixed set across ranks and sum afterwards, rather than every
+        # rank scoring all of it.  The mean is the same either way -- the set and
+        # its order are fixed -- but the duplicated version costs world_size
+        # times the work and makes rank 0 a straggler the others wait on.
+        shard = self.eval_windows[DIST_WRAPPER.rank::DIST_WRAPPER.world_size]
+        totals: dict[str, float] = {}
+        n = 0
+        for window in shard:
+            batch = to_device(collate_window(window), self.device)
+            pred, label, _ = self.raw_model(
+                input_feature_dict=batch["input_feature_dict"],
+                label_dict=batch["label_dict"],
+                label_full_dict=batch["label_full_dict"],
+                mode="train",
+                current_step=self.step,
+                symmetric_permutation=self.symmetric_permutation,
+                eval_training_objective=True,
+            )
+            _, loss_dict = self.loss(
+                feat_dict=batch["input_feature_dict"],
+                pred_dict=pred,
+                label_dict=label,
+                mode="train",
+            )
+            for key, value in loss_dict.items():
+                if "loss" not in key:
+                    continue
+                totals[key] = totals.get(key, 0.0) + float(value)
+            n += 1
+
+        if DIST_WRAPPER.world_size > 1:
+            import torch.distributed as dist
+
+            # Sum the per-rank partial sums and counts, so the reported mean is
+            # over the whole fixed set and does not depend on world_size.
+            keys = sorted(totals)
+            packed = torch.tensor([totals[k] for k in keys] + [float(n)],
+                                  device=self.device, dtype=torch.float64)
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            totals = {k: packed[i].item() for i, k in enumerate(keys)}
+            n = int(packed[-1].item())
+
+        means = {k: v / n for k, v in totals.items()}
+        for key, value in means.items():
+            self.train_metric_wrapper.add(f"heldout/{key}",
+                                          torch.tensor(value), namespace="train")
+        # Injection strength on unseen windows.  High on training windows and
+        # low here would mean WorldParticle is memorising rather than
+        # generalising, which no training-side observable can tell you.
+        stats = observables.read(self.raw_model)
+        for key, value in stats.items():
+            self.train_metric_wrapper.add(f"heldout_wp/{key}",
+                                          torch.tensor(float(value)),
+                                          namespace="train")
+        headline = ", ".join(f"{k}={v:.4f}" for k, v in sorted(means.items())
+                             if not k.startswith("weighted_"))
+        self.print(f"[eval] step {self.step} over {n} held-out windows: {headline}")
+
+        if was_training:
+            self.raw_model.train()

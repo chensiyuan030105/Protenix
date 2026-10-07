@@ -501,11 +501,26 @@ kineidos_configs = {
         # Named, not globbed: a run's config should say which trajectories it
         # saw, so that a later run can be compared to it.
         "train_samples": ListValue(["gagu_100mM_K_agaguu_startI_r1"]),
+        # Held out, scored with the training objective during training.  Named
+        # rather than derived, for the same reason as train_samples.
+        "held_out_samples": ListValue([""]),
+        # How many held-out windows one evaluation round scores.  Fixed, drawn
+        # once, iterated in order.
+        "eval_windows": 64,
+        # Seeds both the held-out window draw and -- reset at the start of every
+        # round -- the noise and augmentation inside the scored forward, so that
+        # round k of one arm scores bit-identical noise to round k of another.
+        "eval_seed": 1234,
         "window_k": 8,
         # Nominal: an epoch is this many draws, not an enumeration (see
         # GAGUWindowDataset).
         "epoch_length": 10000,
         "num_workers": 0,
+        # Where a requeued job looks for its predecessor.  Empty disables
+        # resume.  Must be per-arm: resuming a `zero` checkpoint into a
+        # `random` model would load every shared key and leave the bridge at
+        # initialisation, giving a run that is neither arm.
+        "resume_dir": "",
     },
 }
 

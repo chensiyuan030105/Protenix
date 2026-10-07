@@ -931,6 +931,7 @@ class Protenix(nn.Module):
         symmetric_permutation: SymmetricPermutation = None,
         disable_inplace: bool = False,
         mc_dropout_apply_rate: float = 0.4,
+        eval_training_objective: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Forward pass of the Alphafold3 model.
@@ -969,7 +970,19 @@ class Protenix(nn.Module):
         if mode == "train":
             nc_rng = np.random.RandomState(current_step)
             N_cycle = nc_rng.randint(1, self.N_cycle + 1)
-            assert self.training
+            # Kineidos (P004): the held-out metric is the training objective, so
+            # it has to come through this branch -- but with dropout off.  That
+            # is not a convenience: with dropout active the arms consume
+            # different amounts of RNG, the noise level and augmentation rotation
+            # drawn inside sample_diffusion_training stop matching between arms,
+            # and the comparison silently becomes unpaired.  With dropout off and
+            # the same seed, every arm sees bit-identical noise and rotations, so
+            # the difference between them is the only thing that varies.
+            assert self.training or eval_training_objective, (
+                "mode='train' under model.eval() needs eval_training_objective="
+                "True, which says the caller means to score the training "
+                "objective rather than to train"
+            )
             assert label_dict is not None
             assert symmetric_permutation is not None
 

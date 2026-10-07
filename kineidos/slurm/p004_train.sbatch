@@ -11,25 +11,35 @@
 # The arm is the one argument that must be given:
 #   sbatch --export=ALL,WP_MODE=zero kineidos/slurm/p004_train.sbatch
 #SBATCH --job-name=p004-kineidos
-# h100, not background.  Both are open to grad-students, but PreemptType is
-# preempt/partition_prio with PreemptMode=REQUEUE and PreemptExemptTime=0, and
-# background sits at PriorityTier=5 while h100 and high-priority sit at 10.  A
-# background job is therefore killed without grace and restarted from step 0 --
-# and this trainer cannot resume (try_load_checkpoint requires the missing key
-# set to equal the fusion's, which a full mid-run checkpoint does not satisfy),
-# so the restart would quietly begin again in a new timestamped run directory.
-# h100's partition QoS is background, so this does not spend the high-priority
-# QoS's 12-GPU allowance either.
-#SBATCH --partition=h100
+# background on the A100 nodes, with --requeue and a resume path.
+#
+# Not h100: those GPUs are broken.  deep-h-1 is drained with reason
+# "UserRequestedGPURecovery-20260919", and on deep-h-2 nvidia-smi itself fails
+# with "Unable to determine the device handle for GPU0 ... Unknown Error" while
+# slurm still happily allocates gres:gpu:1 and torch reports cuda=False.  Three
+# jobs ran there CPU-only before this was noticed.  Sixteen idle GPUs on a
+# cluster whose A100s are fully booked is a symptom, not an opportunity.
+#
+# Not high-priority either: it is tier 10 and would not be preempted, but it
+# hits QOSGrpJobsLimit in practice.  background has capacity on the working
+# A100 nodes.  The cost is PriorityTier=5 under PreemptMode=REQUEUE with
+# PreemptExemptTime=0 -- killed without grace whenever a tier-10 job wants the
+# node -- which is why KineidosTrainer.resume and --requeue exist.  Verified on
+# deep-chungus-3: A100-PCIE-40GB, torch sees it, and open3d 0.20.0's compiled
+# continuous_conv runs on CUDA forward and backward with nonzero gradients.
+#SBATCH --partition=background
+#SBATCH --qos=background
 #SBATCH --account=grad-students
+#SBATCH --requeue
+#SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-8,deep-gpu-10,deep-gpu-11
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-# h100 has MaxTime=UNLIMITED and DefaultTime=08:00:00.  Asking for more than we
-# need costs nothing here (the partition is idle and not preemptible) and losing
-# a run to the wall clock costs everything, since there is no resume path yet.
+# MaxTime is UNLIMITED; DefaultTime is 08:00:00.  Resume makes a long request
+# safe, since an interruption of any kind now costs at most one checkpoint
+# interval rather than the whole run.
 #SBATCH --time=48:00:00
 #SBATCH --output=/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace/runs/slurm/%x-%j.out
 #SBATCH --error=/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace/runs/slurm/%x-%j.err
@@ -53,6 +63,11 @@ SEED="${SEED:-42}"
 # five files, ~16 GB per arm, ~47 GB for none/zero/random.  Raise the interval
 # before raising MAX_STEPS.
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-2000}"
+# Held-out scoring runs inside training.  64 windows is a compromise: enough to
+# average over the noise level and the augmentation rotation, few enough that a
+# round costs well under a percent of the interval it covers.
+EVAL_INTERVAL="${EVAL_INTERVAL:-500}"
+EVAL_WINDOWS="${EVAL_WINDOWS:-64}"
 
 # Train / held-out split.  The 64 GAGU trajectories are a balanced
 # 2 salt x 4 sequence x 2 start x 4 replicate design, so the split can be made
@@ -63,15 +78,25 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-2000}"
 # instead asks about chemistry generalisation and is a separate set of runs.
 GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/processed/gagu_internal_loop_v0_1"
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-$(ls -d ${GAGU_ROOT}/*_r[123] 2>/dev/null | xargs -n1 basename | paste -sd,)}"
+HELD_OUT="${HELD_OUT:-$(ls -d ${GAGU_ROOT}/*_r4 2>/dev/null | xargs -n1 basename | paste -sd,)}"
 N_TRAIN=$(echo "${TRAIN_SAMPLES}" | tr ',' '\n' | grep -c .)
+N_HELD=$(echo "${HELD_OUT}" | tr ',' '\n' | grep -c .)
 
-mkdir -p "${WORKSPACE}/runs/slurm" "${WORKSPACE}/runs/p004"
+# Per-arm, and stable across requeues -- init_basics appends a timestamp to the
+# run directory, so a requeued job cannot find its predecessor's checkpoints by
+# any name it can derive itself.
+RESUME_DIR="${RESUME_DIR:-${WORKSPACE}/runs/p004/${RUN_NAME}_resume}"
+
+mkdir -p "${WORKSPACE}/runs/slurm" "${WORKSPACE}/runs/p004" "${RESUME_DIR}"
 cd "${WORKSPACE}"
 
 # Every one of these is load-bearing; see AGENTS.md's "Python 环境与 PYTHONPATH".
 export PYTHONPATH="repos/research/kineidos-v2:repos/research/wp-v2"
 export PYTHONUNBUFFERED=1
-export LD_LIBRARY_PATH="${ENV}/lib"
+# Prepend, do not replace.  AGENTS.md documents the replacing form, which works
+# on the login node only because libcuda is not needed there; on a GPU node it
+# would hide the driver libraries that live in the system paths.
+export LD_LIBRARY_PATH="${ENV}/lib:${LD_LIBRARY_PATH:-}"
 export ATTN_IMPL="${ATTN_IMPL:-sdpa}"
 # Defaults to the plain-PyTorch LayerNorm, which needs no nvcc.  The fused path
 # is faster where nvcc exists and is weight-identical (same state_dict keys), so
@@ -86,7 +111,8 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 
 echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
 echo "WP_MODE=${WP_MODE} RUN_NAME=${RUN_NAME} MAX_STEPS=${MAX_STEPS} SEED=${SEED}"
-echo "TRAIN_SAMPLES: ${N_TRAIN} trajectories (r1-r3); r4 held out"
+echo "TRAIN_SAMPLES: ${N_TRAIN} trajectories (r1-r3); HELD_OUT: ${N_HELD} (r4)"
+echo "RESUME_DIR=${RESUME_DIR} (exists: $([ -e "${RESUME_DIR}/latest.pt" ] && echo yes || echo no))"
 "${ENV}/bin/python" -u -c 'import torch; print("torch", torch.__version__, "cuda", torch.cuda.is_available(), torch.cuda.device_count())'
 
 # env.lock is written by the trainer, into the run directory it creates --
@@ -102,7 +128,7 @@ exec "${ENV}/bin/python" -u -m kineidos.train.main \
   --max_steps "${MAX_STEPS}" \
   --seed "${SEED}" \
   --log_interval 50 \
-  --eval_interval -1 \
+  --eval_interval "${EVAL_INTERVAL}" \
   --checkpoint_interval "${CHECKPOINT_INTERVAL}" \
   --use_wandb false \
   --skip_confidence true \
@@ -111,4 +137,7 @@ exec "${ENV}/bin/python" -u -m kineidos.train.main \
   --loss.weight.alpha_distogram 0.0 \
   --kineidos.train_samples "${TRAIN_SAMPLES}" \
   --kineidos.num_workers 4 \
+  --kineidos.resume_dir "${RESUME_DIR}" \
+  --kineidos.held_out_samples "${HELD_OUT}" \
+  --kineidos.eval_windows "${EVAL_WINDOWS}" \
   "$@"
