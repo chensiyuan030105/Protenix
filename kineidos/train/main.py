@@ -21,6 +21,8 @@ import logging
 import os
 from collections.abc import Mapping
 
+import torch
+
 from configs.configs_base import configs as configs_base
 from configs.configs_data import data_configs
 from configs.configs_model_type import model_configs
@@ -28,6 +30,38 @@ from protenix.config import parse_configs
 from protenix.utils.distributed import DIST_WRAPPER
 
 from kineidos.train.trainer import KineidosTrainer, wp_token_dim_for
+
+# Undo protenix/data/pipeline/data_pipeline.py:36, which runs at import and sets
+# torch's sharing strategy to "file_system".  Torch's own default on Linux is
+# "file_descriptor", and the difference is who can destroy a batch in flight.
+#
+# Under "file_system" every tensor a dataloader worker hands to the main process
+# is a *named* file under /dev/shm, opened by name on the far side.  Under
+# "file_descriptor" the same file is unlinked the moment it is created and only
+# its descriptor crosses the socket, so the mapping has no name for anything
+# else to act on.
+#
+# This is not hypothetical.  On 2026-10-07 at 19:34:35 another job of ours
+# landed on deep-chungus-1 and its prolog cleared /dev/shm; twenty seconds later
+# both P009 arms on that node died inside `for batch in self.train_dl`, all six
+# ranks at the same second, with
+#
+#   RuntimeError: unable to open shared memory object </torch_...> in
+#   read-write mode: No such file or directory (2)
+#
+# raised from reductions.py's rebuild_storage_filename -- the "file_system" path.
+# Neither resource was short: /dev/shm was 252 GB at 1% and the descriptor limit
+# was 1048576.  The files had simply been deleted by someone else.  The two arms
+# alone on their nodes were untouched, which is what makes this the explanation
+# rather than a guess about memory.
+#
+# Upstream's choice is defensible for its own pipeline -- thousands of mmCIF
+# workers can exhaust descriptors -- but we run three ranks of four workers on
+# windows of 470 atoms, a few hundred descriptors against a million.
+#
+# It must be set before any worker is forked, hence here rather than in
+# init_data, and after the protenix import that sets it the other way.
+torch.multiprocessing.set_sharing_strategy("file_descriptor")
 
 
 def deep_update(d, u):
@@ -81,9 +115,23 @@ def main() -> None:
     # numpy, torch, torch.cuda -- from a rank-derived seed.  A set_all_seeds
     # call here would be overwritten by it and would read as if it were doing
     # something.
+    # Fatal, not a warning.  Something importing protenix later could set it
+    # back, and the symptom would be a crash hours in that looks like a cluster
+    # problem rather than a configuration one.
+    strategy = torch.multiprocessing.get_sharing_strategy()
+    if strategy != "file_descriptor":
+        raise SystemExit(
+            f"refusing to start: torch sharing strategy is {strategy!r}, not "
+            f"'file_descriptor'. Under 'file_system' the dataloader's tensors "
+            f"are named files in /dev/shm and any job that clears it on this "
+            f"node kills this run mid-batch; that is what happened to two arms "
+            f"on 2026-10-07. Something re-set it after kineidos.train.main's "
+            f"module level -- find it rather than removing this check."
+        )
     logging.info(
         f"model={model_name} wp.mode={wp_mode} "
         f"wp_token_dim={token_dim} cycle={configs.model.N_cycle} "
+        f"sharing={strategy} "
         f"rank={DIST_WRAPPER.rank}/{DIST_WRAPPER.world_size}"
     )
     KineidosTrainer(configs).run()
