@@ -36,10 +36,20 @@
 # node -- which is why KineidosTrainer.resume and --requeue exist.  Verified on
 # deep-chungus-3: A100-PCIE-40GB, torch sees it, and open3d 0.20.0's compiled
 # continuous_conv runs on CUDA forward and backward with nonzero gradients.
-#SBATCH --partition=background
-#SBATCH --qos=background
+# high-priority（2026-10-07 改）。原先用 background 是因为 high-priority 当时被
+# QOSGrpJobsLimit 挡住（全组 GrpJobs=8）；那个限制后来松开了。改的理由是实测代价：
+# background 是 PriorityTier=5、PreemptMode=REQUEUE、PreemptExemptTime=0，`none`
+# 档在 14 小时内被抢占两次，每次损失到上一个 checkpoint 的距离加一次 10–35 分钟的
+# 启动，而且 requeue 复用同一个作业 ID ⟹ **日志被覆盖**，它前三个干净 eval 点就是
+# 这么丢的。high-priority 是 tier 10，不被抢占；每用户 12 张 GPU 的额度装得下三档
+# 共 9 张。
+#SBATCH --partition=high-priority
+#SBATCH --qos=high-priority
 #SBATCH --account=grad-students
 #SBATCH --requeue
+# 追加而非覆盖。requeue 复用作业 ID，默认的覆盖模式会抹掉重排前的全部日志——
+# 包括抢占本身的证据，于是连"为什么重启了"都查不到。
+#SBATCH --open-mode=append
 #SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-8,deep-gpu-10,deep-gpu-11
 # One task; torchrun forks one process per GPU inside it.  --gres and --mem are
 # passed on the sbatch command line so NGPU can vary without editing this file.
