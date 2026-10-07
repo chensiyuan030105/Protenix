@@ -932,6 +932,7 @@ class Protenix(nn.Module):
         disable_inplace: bool = False,
         mc_dropout_apply_rate: float = 0.4,
         eval_training_objective: bool = False,
+        n_cycle: Optional[int] = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Forward pass of the Alphafold3 model.
@@ -968,8 +969,21 @@ class Protenix(nn.Module):
         input_feature_dict = update_input_feature_dict(input_feature_dict)
 
         if mode == "train":
-            nc_rng = np.random.RandomState(current_step)
-            N_cycle = nc_rng.randint(1, self.N_cycle + 1)
+            # Kineidos (P004): n_cycle pins the recycling depth instead of
+            # drawing it.  Upstream seeds the draw with current_step, so the
+            # depth is a deterministic function of the step number -- fine as
+            # training noise (it teaches the model to work at any depth) but a
+            # confound in a held-out metric: four evaluation rounds drew 8, 1, 2
+            # and 4, so the curve over steps was comparing different recycling
+            # depths rather than different training states.  Both arms draw the
+            # same depth at a given step, so pairing survived; the curve did not.
+            # set_all_seeds cannot reach this, because RandomState(current_step)
+            # takes its seed from the step and nothing else.
+            if n_cycle is not None:
+                N_cycle = int(n_cycle)
+            else:
+                nc_rng = np.random.RandomState(current_step)
+                N_cycle = nc_rng.randint(1, self.N_cycle + 1)
             # Kineidos (P004): the held-out metric is the training objective, so
             # it has to come through this branch -- but with dropout off.  That
             # is not a convenience: with dropout active the arms consume

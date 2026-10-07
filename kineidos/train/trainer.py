@@ -410,6 +410,14 @@ class KineidosTrainer(AF3Trainer):
                 current_step=self.step,
                 symmetric_permutation=self.symmetric_permutation,
                 eval_training_objective=True,
+                # Pin the recycling depth.  Upstream draws it from
+                # RandomState(current_step), which made every round use a
+                # different trunk depth -- rounds at steps 499/999/1499/1999
+                # drew 8/1/2/4 -- so the curve measured a depth lottery as much
+                # as it measured learning.  Full depth is what inference uses
+                # (main_inference_loop passes self.N_cycle), so it is the depth
+                # the number should describe.
+                n_cycle=self.configs.model.N_cycle,
             )
             _, loss_dict = self.loss(
                 feat_dict=batch["input_feature_dict"],
@@ -449,7 +457,10 @@ class KineidosTrainer(AF3Trainer):
                                           namespace="train")
         headline = ", ".join(f"{k}={v:.4f}" for k, v in sorted(means.items())
                              if not k.startswith("weighted_"))
-        self.print(f"[eval] step {self.step} over {n} held-out windows: {headline}")
+        # N_cycle in the line, because it changes the numbers and a reader
+        # comparing two logs has no other way to know it was held fixed.
+        self.print(f"[eval] step {self.step} over {n} held-out windows "
+                   f"(N_cycle={self.configs.model.N_cycle}): {headline}")
 
         if was_training:
             self.raw_model.train()
