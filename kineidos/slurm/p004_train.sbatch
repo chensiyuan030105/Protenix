@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 # P004: Protenix diffusion head + WorldParticle injection, AF3 trunk frozen.
 #
-# One GPU on purpose.  runner/train.py builds DDP with static_graph=True, which
-# requires the same parameters to participate every iteration, and
-# main_train_loop drops embeddings at two places by chance; turning the
-# confidence head off removes one of the two and the combination has never been
-# run on more than one device (plan 2.14).  Multi-GPU comes after a two-card
-# smoke test, not before.
+# DDP via torchrun.  runner/train.py builds DDP with static_graph=True, which
+# requires the same parameters to participate every iteration.  That turned out
+# to be satisfied: main_train_loop's two probabilistic drops set
+# use_conditioning=False, which *zeroes the tensors* rather than skipping
+# modules (diffusion.py:143), so the graph is identical every iteration -- and
+# both drop rates are 0.0 by default anyway.  find_unused_parameters=False is
+# likewise fine: frozen parameters are excluded from DDP's reducer rather than
+# being "unused", and the WorldParticle bridge is a submodule whose output is in
+# the graph every iteration.
 #
-# The arm is the one argument that must be given:
-#   sbatch --export=ALL,WP_MODE=zero kineidos/slurm/p004_train.sbatch
+# All arms must share one world size.  Different GPU counts mean different
+# numbers of windows per step, which is a different optimisation trajectory --
+# the ablation would stop being an ablation.  They need not start at the same
+# time, only to match.
+#
+#   sbatch --gres=gpu:a100:3 --cpus-per-task=12 --mem=160G \
+#          --export=ALL,WP_MODE=zero,NGPU=3 \
+#          kineidos/slurm/p004_train.sbatch
 #SBATCH --job-name=p004-kineidos
 # background on the A100 nodes, with --requeue and a resume path.
 #
@@ -32,11 +41,10 @@
 #SBATCH --account=grad-students
 #SBATCH --requeue
 #SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-8,deep-gpu-10,deep-gpu-11
+# One task; torchrun forks one process per GPU inside it.  --gres and --mem are
+# passed on the sbatch command line so NGPU can vary without editing this file.
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --gres=gpu:1
 # MaxTime is UNLIMITED; DefaultTime is 08:00:00.  Resume makes a long request
 # safe, since an interruption of any kind now costs at most one checkpoint
 # interval rather than the whole run.
@@ -51,6 +59,7 @@ ENV="/mnt/xfs/home/mhg/anaconda3/envs/kineidos-v2-slurm"
 CHECKPOINT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/runtimes/checkpoints/protenix_pretrained/protenix_base_default_v1.0.0.pt"
 
 WP_MODE="${WP_MODE:?set WP_MODE to none, zero, random or pretrained}"
+NGPU="${NGPU:-1}"
 RUN_NAME="${RUN_NAME:-p004_${WP_MODE}}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 SEED="${SEED:-42}"
@@ -107,19 +116,53 @@ export LAYERNORM_TYPE="${LAYERNORM_TYPE:-torch}"
 export TRIANGLE_ATTENTION="${TRIANGLE_ATTENTION:-cuequivariance}"
 export TRIANGLE_MULTIPLICATIVE="${TRIANGLE_MULTIPLICATIVE:-cuequivariance}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+# Suggested by the allocator itself when it ran out.  Our own footprint is small
+# -- a two-rank probe was using 3.9 GiB when it died -- but the GPUs here are not
+# exclusive: slurm allocated us a device on deep-chungus-3 that already had
+# another user's 35.18 GiB process on it.  gres accounting says a device is free;
+# it does not say the memory is.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
 echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
 echo "WP_MODE=${WP_MODE} RUN_NAME=${RUN_NAME} MAX_STEPS=${MAX_STEPS} SEED=${SEED}"
 echo "TRAIN_SAMPLES: ${N_TRAIN} trajectories (r1-r3); HELD_OUT: ${N_HELD} (r4)"
 echo "RESUME_DIR=${RESUME_DIR} (exists: $([ -e "${RESUME_DIR}/latest.pt" ] && echo yes || echo no))"
-"${ENV}/bin/python" -u -c 'import torch; print("torch", torch.__version__, "cuda", torch.cuda.is_available(), torch.cuda.device_count())'
+# Fatal, not informational.  Three jobs ran to completion on CPU on deep-h-2
+# because slurm allocated gres:gpu:1 on a node whose driver could not talk to
+# the devices -- torch reported cuda=False and nothing stopped the run.  A
+# silently CPU-only training job is ~100x too slow and produces a run directory
+# that looks exactly like a real one.
+"${ENV}/bin/python" -u - "${NGPU}" <<'PYEOF'
+import sys, torch
+want = int(sys.argv[1])
+have = torch.cuda.device_count()
+print(f"torch {torch.__version__} cuda={torch.cuda.is_available()} devices={have}")
+if not torch.cuda.is_available() or have < want:
+    raise SystemExit(
+        f"refusing to start: asked for {want} GPU(s), torch sees {have}. "
+        f"slurm can allocate a GPU on a node whose driver is broken "
+        f"(deep-h-2 did exactly that); check nvidia-smi on this node."
+    )
+for i in range(have):
+    p = torch.cuda.get_device_properties(i)
+    print(f"  gpu{i} {p.name} {p.total_memory / 2**30:.0f} GiB")
+PYEOF
 
 # env.lock is written by the trainer, into the run directory it creates --
 # init_basics appends a timestamp to run_name, so a lock written from here would
 # land next to the run instead of inside it.  See KineidosTrainer.write_env_lock.
 
-exec "${ENV}/bin/python" -u -m kineidos.train.main \
+# One master port per job, or two jobs landing on the same node collide.
+MASTER_PORT=$(( 20000 + (${SLURM_JOB_ID:-$$} % 20000) ))
+if [ "${NGPU}" -gt 1 ]; then
+  LAUNCH=("${ENV}/bin/torchrun" "--nproc_per_node=${NGPU}" "--master_port=${MASTER_PORT}")
+  echo "DDP: ${NGPU} ranks, master_port=${MASTER_PORT}"
+else
+  LAUNCH=("${ENV}/bin/python" "-u")
+fi
+
+exec "${LAUNCH[@]}" -m kineidos.train.main \
   --wp.mode "${WP_MODE}" \
   --load_checkpoint_path "${CHECKPOINT}" \
   --project p004 \
