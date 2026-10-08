@@ -499,7 +499,7 @@ class KineidosTrainer(AF3Trainer):
         # D1).  Off by default, and after the per-window rows are already on
         # disk: this is the new and less proven of the two, and a failure in it
         # must not cost the round's held-out numbers.
-        if self.configs.kineidos.sigma_grid:
+        if self.configs.kineidos.sigma_grid and self.sigma_grid_due():
             from kineidos import score_sigma_grid
 
             out = self.configs.kineidos.sigma_grid_out
@@ -510,10 +510,32 @@ class KineidosTrainer(AF3Trainer):
                 or self.configs.run_name,
                 out_dir=Path(out) if out else Path(self.run_dir) / "sigma_grid",
                 n_noise=int(self.configs.kineidos.sigma_grid_noise),
+                n_windows=int(self.configs.kineidos.sigma_grid_windows),
             )
 
         if was_training:
             self.raw_model.train()
+
+    def sigma_grid_due(self) -> bool:
+        """Is this one of the rounds the per-sigma grid runs on.
+
+        0 means every round, which is what the key defaulted to before it
+        existed.  Otherwise the grid runs on rounds whose step is at or past
+        the next multiple of the interval -- rounded up from eval_interval,
+        since the grid can only run where a round does, and the last step is
+        always included because run() evaluates there whatever the interval
+        says and that round is the arm's final state.
+        """
+        every = int(self.configs.kineidos.sigma_grid_interval)
+        if every <= 0:
+            return True
+        if self.step >= self.configs.max_steps - 1:
+            return True
+        interval = max(int(self.configs.eval_interval), 1)
+        # The round index, so the test does not depend on whether the step
+        # numbering is 0- or 1-based at this point in the loop.
+        rounds_per_grid = max(int(round(every / interval)), 1)
+        return ((self.step + 1) // interval) % rounds_per_grid == 0
 
     def write_heldout_rows(self, rows: list[dict[str, Any]]) -> None:
         """One line per held-out window, per rank, per evaluation round.

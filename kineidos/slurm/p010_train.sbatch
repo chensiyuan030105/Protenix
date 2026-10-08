@@ -73,8 +73,17 @@ EVAL_WINDOWS="${EVAL_WINDOWS:-256}"
 # The config default stays false so that merging the tools back into v3 cannot
 # alter P009's protocol (D11).
 SKIP_MINI_ROLLOUT="${SKIP_MINI_ROLLOUT:-true}"
-# D1: every round writes the per-sigma file beside the per-window one.
+# D1: the per-sigma file beside the per-window one.
 SIGMA_GRID="${SIGMA_GRID:-true}"
+# How often, and over how many windows.  Both default to "every round, all of
+# them", which is what the config defaults to; they are here because the grid
+# costs 3.28 s a window (measured, artifacts/reports/P010/step_budget.json) and
+# at 256 windows every 250 steps that is 1.9 GPU-hours against the arm's own
+# 2.5.  The held-out rounds stay at EVAL_INTERVAL whatever this says -- the
+# oracle gate reads the first 500 steps and arm B the 500 after its release,
+# and those are the rounds that cadence is for.
+SIGMA_GRID_INTERVAL="${SIGMA_GRID_INTERVAL:-0}"
+SIGMA_GRID_WINDOWS="${SIGMA_GRID_WINDOWS:-0}"
 
 GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/processed/gagu_internal_loop_v0_1"
 # The same split as p004_train.sbatch: r1-r3 train, r4 held out.  It has to be
@@ -101,6 +110,7 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
 echo "ARM=${ARM} TREE=${TREE} WP_MODE=${WP_MODE} SEED=${SEED} MAX_STEPS=${MAX_STEPS}"
 echo "skip_mini_rollout=${SKIP_MINI_ROLLOUT} sigma_grid=${SIGMA_GRID}"
+echo "sigma_grid_interval=${SIGMA_GRID_INTERVAL} (0 = every eval round) sigma_grid_windows=${SIGMA_GRID_WINDOWS} (0 = all)"
 echo "TRAIN: $(echo "${TRAIN_SAMPLES}" | tr ',' '\n' | grep -c .) trajectories; HELD_OUT: $(echo "${HELD_OUT}" | tr ',' '\n' | grep -c .)"
 echo "RESUME_DIR=${RESUME_DIR} (exists: $([ -e "${RESUME_DIR}/latest.pt" ] && echo yes || echo no))"
 NGPU_WANT=1
@@ -136,4 +146,6 @@ exec "${ENV}/bin/python" -u -m kineidos.train.main \
   --kineidos.eval_windows "${EVAL_WINDOWS}" \
   --kineidos.sigma_grid "${SIGMA_GRID}" \
   --kineidos.sigma_grid_arm "${ARM}" \
+  --kineidos.sigma_grid_interval "${SIGMA_GRID_INTERVAL}" \
+  --kineidos.sigma_grid_windows "${SIGMA_GRID_WINDOWS}" \
   "$@"

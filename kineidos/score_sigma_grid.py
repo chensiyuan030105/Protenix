@@ -219,7 +219,8 @@ def grid_plan(sigmas: list[float], n_noise: int) -> list[tuple[float, int]]:
 
 @torch.no_grad()
 def score(trainer: Any, *, step: int, arm: str, out_dir: Path,
-          n_noise: int = 4, sigmas: Optional[list[float]] = None) -> Path:
+          n_noise: int = 4, sigmas: Optional[list[float]] = None,
+          n_windows: int = 0) -> Path:
     """Score the held-out set on the grid.  Returns the file it wrote.
 
     Deliberately a function of the trainer rather than a method on it: it is
@@ -246,6 +247,13 @@ def score(trainer: Any, *, step: int, arm: str, out_dir: Path,
         )
     plan = grid_plan(sigmas, n_noise)
 
+    # A prefix of the fixed ordered set, not a sample of it: the ids stay the
+    # global ones, so a round scored on 128 windows still pairs against a
+    # 256-window scoring of a checkpoint on the 128 they share.
+    windows = trainer.eval_windows
+    if n_windows and n_windows < len(windows):
+        windows = windows[:n_windows]
+
     model = trainer.raw_model
     was_training = model.training
     saved_sampler = model.train_noise_sampler
@@ -268,7 +276,7 @@ def score(trainer: Any, *, step: int, arm: str, out_dir: Path,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{arm}_step{step}.rank{DIST_WRAPPER.rank}.jsonl"
-    shard = trainer.eval_windows[DIST_WRAPPER.rank::DIST_WRAPPER.world_size]
+    shard = windows[DIST_WRAPPER.rank::DIST_WRAPPER.world_size]
     written = 0
     try:
         with open(path, "w") as handle:
@@ -466,7 +474,8 @@ def main() -> int:
     out_dir = Path(cfg.sigma_grid_out or
                    (Path(trainer.run_dir) / "sigma_grid"))
     score(trainer, step=step, arm=arm, out_dir=out_dir,
-          n_noise=int(cfg.sigma_grid_noise))
+          n_noise=int(cfg.sigma_grid_noise),
+          n_windows=int(cfg.sigma_grid_windows))
     return 0
 
 

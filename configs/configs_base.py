@@ -534,6 +534,25 @@ kineidos_configs = {
         # with eleven sigmas that is a 44-sample diffusion batch, close enough
         # to the 48 of training that memory behaves the same.
         "sigma_grid_noise": 4,
+        # How often the grid runs, in steps.  0 means "every evaluation round",
+        # which is the behaviour before this key existed and so the default.
+        #
+        # It exists because the grid turned out to cost as much as the training
+        # it is measuring: 3.28 s a window, measured, times 256 windows is 14
+        # minutes a round, and at eval_interval 250 over 2000 steps that is
+        # eight rounds -- 1.9 GPU-hours against the arm's own 2.5.  The
+        # held-out rounds must stay at 250, because the oracle gate reads the
+        # first 500 steps and arm B reads the 500 after its release (section 6
+        # items 2 and 3); the grid does not need that cadence, since what it
+        # tracks moves on a scale of a thousand steps.  Rounded up to a
+        # multiple of eval_interval, because it can only run where a round does.
+        "sigma_grid_interval": 0,
+        # How many of the held-out windows the grid scores.  0 means all of
+        # them (kineidos.eval_windows), which is what section 4 fixes for
+        # scoring a checkpoint.  A smaller number is a prefix of the same fixed
+        # ordered set, so the rows still carry global window_ids and still pair
+        # against a 256-window scoring on the windows they share.
+        "sigma_grid_windows": 0,
         # The name written into every row's `arm` field, and into the file
         # name.  Empty means "derive it", which is right inside a training run
         # and wrong when scoring someone else's checkpoint.
