@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import statistics
 import sys
@@ -213,29 +214,66 @@ def main() -> int:
                 if bin_of(r["stride"]) == name]
         return (statistics.fmean(vals) if vals else float("nan")), len(vals)
 
+    def paired(a: str, b: str, name: str) -> tuple[float, float, int]:
+        """Mean and standard error of the per-window difference a - b.
+
+        Reported alongside section 6.2's rule, not instead of it.  The rule
+        compares |random - zero| against |zero - zero-seed2|, and both sides are
+        single estimates: at step 499 the first was 0.0082 and the second 0.0051,
+        a ratio of 1.6 that the rule reads as "above the floor" -- while the
+        standard errors were 0.0061 and 0.0074, so neither side was resolved
+        from zero and a floor that happened to come out small made a
+        non-significant effect look like a finding.  The pairing is what makes
+        this cheap: every arm scores the same windows under the same noise, so
+        the per-window difference drops the between-trajectory variance that
+        dominates the raw loss (std 0.254 against 0.054, a factor of 4.7).
+        """
+        ids = [w for w, r in data[b][step].items() if bin_of(r["stride"]) == name]
+        d = [data[a][step][w][args.metric] - data[b][step][w][args.metric]
+             for w in ids]
+        if len(d) < 2:
+            return (float("nan"), float("nan"), len(d))
+        return statistics.fmean(d), statistics.stdev(d) / math.sqrt(len(d)), len(d)
+
     verdicts = []
     lines += ["## 三箱", "",
               "| 箱 | stride | n | 可用信息 | `zero` | `random` | "
-              "`random−zero` | 噪声底 \\|zero−seed2\\| | 比值 | 判定 |",
-              "|---|---|---:|---:|---:|---:|---:|---:|---:|---|"]
+              "`random−zero` | 配对SE | \\|t\\| | "
+              "噪声底 \\|zero−seed2\\| | 底的SE | 比值 | 判定 |",
+              "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for name, lo, hi, info in BINS:
         z, n = bin_mean("zero", name)
         r, _ = bin_mean("random", name)
         s2, _ = bin_mean("zero-seed2", name)
-        effect = r - z
-        floor = abs(z - s2)
+        effect, se_effect, _ = paired("random", "zero", name)
+        floor_signed, se_floor, _ = paired("zero", "zero-seed2", name)
+        floor = abs(floor_signed)
         ratio = abs(effect) / floor if floor > 0 else float("inf")
         above = abs(effect) > floor
         lower = effect < 0
+        # Section 6.2's registered rule, unchanged.  The t statistics are
+        # reported next to it, not folded into it.
         verdict = ("**random 更低且超噪声底**" if above and lower
                    else "超噪声底但 random 更高" if above
                    else "不可区分")
-        verdicts.append((name, above, lower, effect, floor, ratio, z))
+        t_effect = abs(effect / se_effect) if se_effect else float("nan")
+        verdicts.append((name, above, lower, effect, floor, ratio, z,
+                         se_effect, t_effect, se_floor))
         lines.append(
             f"| {name} | {lo}–{hi} | {n} | {info:.0%} | {z:.4f} | {r:.4f} | "
-            f"{effect:+.4f} ({effect / z:+.2%}) | {floor:.4f} "
-            f"({floor / z:.2%}) | {ratio:.2f} | {verdict} |")
+            f"{effect:+.4f} ({effect / z:+.2%}) | ±{se_effect:.4f} | "
+            f"{t_effect:.1f} | {floor:.4f} ({floor / z:.2%}) | "
+            f"±{se_floor:.4f} | {ratio:.2f} | {verdict} |")
     lines.append("")
+    # Said once, in the report, because a ratio of two unresolved estimates is
+    # the way this read goes wrong.
+    unresolved = [v[0] for v in verdicts if v[8] < 2.0]
+    if unresolved:
+        lines += [
+            f"> **{', '.join(unresolved)} 的效应没有从零分辨出来**（|t| < 2）。"
+            f"§6.2 的「比值」是两个点估计相除，而两边各有自己的误差棒；"
+            f"底偶然偏小就会把一个不显著的效应读成超了底。"
+            f"判据按登记的规则给出，不改；这一行是多报的诊断。", ""]
 
     if "none" in data:
         lines += ["## `none`（不进主结论，只复核 `zero` 的额外 Linear 是中性的）", "",
@@ -249,13 +287,25 @@ def main() -> int:
                          f"({(z - nn) / z:+.2%}) | {abs(z - s2):.4f} |")
         lines.append("")
 
-    name, above, lower, effect, floor, ratio, z = verdicts[0]
+    name, above, lower, effect, floor, ratio, z, se_effect, t_effect, se_floor = \
+        verdicts[0]
     lines += ["## 判定", ""]
     if above and lower:
         decay = [v for v in verdicts[1:]]
-        shape = ("随 Δt 衰减，与预期一致"
-                 if all(abs(v[3]) <= abs(effect) for v in decay)
-                 else "**不随 Δt 衰减——先怀疑读到了别的东西**（§6.2）")
+        # Whether the bin-to-bin change is resolved, not just its sign: at step
+        # 499 the effect looked like it grew with dt (+0.42% / +0.82% / +1.02%)
+        # while bin1 - bin3 was -0.0112 +/- 0.0086, |t| = 1.3 -- no trend at all.
+        spread = effect - verdicts[-1][3]
+        se_spread = math.hypot(se_effect, verdicts[-1][7])
+        t_spread = abs(spread / se_spread) if se_spread else float("nan")
+        if t_spread < 2.0:
+            shape = (f"**三箱之间没有分辨出差别**（箱1−箱3 = {spread:+.4f} "
+                     f"± {se_spread:.4f}，|t| = {t_spread:.1f}），所以不要把"
+                     f"箱间的升降当成 Δt 依赖")
+        elif all(abs(v[3]) <= abs(effect) for v in decay):
+            shape = "随 Δt 衰减，与预期一致"
+        else:
+            shape = "**不随 Δt 衰减——先怀疑读到了别的东西**（§6.2）"
         lines += [
             f"箱 1 上 `random` 比 `zero` 低 {abs(effect):.4f}"
             f"（{abs(effect) / z:.2%}），是该箱噪声底的 {ratio:.2f} 倍，"
