@@ -186,9 +186,31 @@ if not torch.cuda.is_available() or have < want:
         f"slurm can allocate a GPU on a node whose driver is broken "
         f"(deep-h-2 did exactly that); check nvidia-smi on this node."
     )
+# Driver-side queries only, all three of them: device_count, is_available and
+# get_device_properties ask the driver and never create a context.  They all
+# pass on a card whose *runtime* cannot start -- deep-chungus-7's GPU 7 is
+# exactly that, and nvidia-smi calls it a healthy A100 80GB with all memory
+# free.  So force a real kernel on every allocated device: this creates the
+# context, allocates, runs a cuBLAS matmul and copies the result back, and says
+# which device failed.  Costs well under a second and runs before the 48 GAGU
+# trajectories load, which is the 10-35 minutes it saves.
 for i in range(have):
     p = torch.cuda.get_device_properties(i)
-    print(f"  gpu{i} {p.name} {p.total_memory / 2**30:.0f} GiB")
+    try:
+        x = torch.randn(1024, 1024, device=f"cuda:{i}")
+        got = float((x @ x).sum().item())
+    except Exception as exc:  # noqa: BLE001 - the failure is the result
+        raise SystemExit(
+            f"refusing to start: gpu{i} ({p.name}) answers the driver but "
+            f"cannot run a kernel -- {type(exc).__name__}: {exc}. That is the "
+            f"deep-chungus-7 GPU 7 failure; pick another node."
+        )
+    if got != got:  # NaN
+        raise SystemExit(
+            f"refusing to start: gpu{i} ({p.name}) ran a matmul and returned "
+            f"NaN, so the device is computing wrong answers rather than failing."
+        )
+    print(f"  gpu{i} {p.name} {p.total_memory / 2**30:.0f} GiB  kernel ok")
 PYEOF
 
 # env.lock is written by the trainer, into the run directory it creates --
