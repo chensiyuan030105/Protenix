@@ -87,6 +87,23 @@ export TRIANGLE_MULTIPLICATIVE="${TRIANGLE_MULTIPLICATIVE:-cuequivariance}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
+# On by default here, and only here.  This job's criterion *is* bit-identity,
+# and with the faster kernels the scoring is not reproducible even against
+# itself: measured envelope 1.478e-04 on loss_edm_weighted (jobs 2149391 /
+# 2149412, same node, same device).  With determinism on, two independent
+# scorings of one arm come out byte-identical over 2816 rows (2149525 /
+# 2149526 compared by 2149583) and torch reports no operation without a
+# deterministic implementation, at no measurable cost -- 3.3 s a window either
+# way.
+#
+# Not on for the arms or the scoring sweeps: their readings sit 400x above
+# that envelope and average over 1024-2048 rows a band, so determinism buys
+# them nothing, while the training backward has more nondeterministic
+# operations to replace than the forward does and the cost there is unmeasured.
+export KINEIDOS_DETERMINISTIC="${KINEIDOS_DETERMINISTIC:-1}"
+if [ "${KINEIDOS_DETERMINISTIC}" = "1" ]; then
+  export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+fi
 
 echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
 echo "TREES=${TREES}"
