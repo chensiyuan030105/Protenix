@@ -1,0 +1,392 @@
+#!/usr/bin/env python
+"""P010 section 6's readings, off the per-sigma jsonl.  Registered in advance.
+
+The same discipline as kineidos/read_heldout.py: what counts as an effect is a
+property of this file, written before the numbers are in, rather than of
+whatever the numbers turn out to look like.  Section 6, item by item:
+
+  * **Three bands, by c_skip** (section 1's table): high is sigma > 24.4
+    (c_skip < 0.3, 14% of the training draw, `h` is the only extra
+    information there is), mid is 5.3-24.4 (the skip term and the network's
+    output have to agree on a reference frame), low is sigma < 5.3 (the output
+    is mostly x_noisy copied through, so no history could matter).  The band is
+    carried in each row by the scorer, not recomputed here.
+  * **Paired, on (window_id, sigma, noise_idx).**  Every arm uses
+    eval_seed=1234 and the same fixed window set, so the same key is the same
+    window under the same noise at the same noise level.  That the keys agree
+    is checked rather than assumed: if they do not, the per-band means compare
+    different problems and everything below is void.
+  * **The floor is |zero - zero-seed2| on that band**, not a standard error on
+    a mean.  P004's reason stands: `none` -> `zero` is provably the identity at
+    step 0 and still moved the held-out loss 0.31-1.70%, while `zero` ->
+    `random` -- 73.45M parameters and a real h -- moved it 0.03%.
+  * **The reading** (item 1): the high band above its floor with `random`
+    lower means "h carries history"; all three bands the same sign and
+    magnitude means "what we are reading is capacity", reported as such; the
+    high band also below its floor means indistinguishable and the oracle gate
+    decides.
+  * **The oracle gate** (item 2): high-band paired MSE down more than 50% from
+    `random-1gpu`, *and* `oracle-decoy`'s same number no larger than
+    |zero-1gpu - random-1gpu|.  Both halves, because a drop that the decoy
+    reproduces is the pipeline being busy rather than information arriving.
+
+Also reports, because section 4 asks for it, the three dt bins inside each
+band -- the effect should decay with dt, and one that does not is more likely
+to be something else (P009 section 6.2 registered that in advance too).
+
+`--identical A B` is section 4's and section 6 item 5b's acceptance instead of
+a reading: it compares two scorings byte for byte and, if they differ, says
+which key and by how much, which is the difference between "the tool is
+nondeterministic" and "the fusion point moved".
+
+Run as a slurm job, not on the login node -- AGENTS.md / P006 D19, and the
+full set is ten arms x 11k rows:
+
+    sbatch repos/research/kineidos-v3-diag/kineidos/slurm/p010_readout.sbatch
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import math
+import statistics
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+BANDS = ("high", "mid", "low")
+# stride bins, as P009 section 6.2 cut them: dt = stride * 0.1 ns.
+DT_BINS = (("bin1", 1, 2), ("bin2", 3, 5), ("bin3", 6, 10))
+METRICS = ("mse_aligned", "smooth_lddt", "loss_unweighted", "loss_edm_weighted")
+
+
+def key_of(row: dict[str, Any]) -> tuple[int, float, int]:
+    """What makes two rows the same measurement in two arms.
+
+    sigma is rounded to 6 significant figures before it becomes part of a key.
+    It is written to the file as a float and read back exactly, so this is not
+    about round-tripping -- it is so that a grid recomputed from the same
+    constants on another machine still joins.
+    """
+    return (int(row["window_id"]), float(f"{row['sigma']:.6g}"),
+            int(row["noise_idx"]))
+
+
+def load(path: Path) -> dict[tuple[int, float, int], dict[str, Any]]:
+    out: dict[tuple[int, float, int], dict[str, Any]] = {}
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        k = key_of(row)
+        if k in out:
+            raise SystemExit(
+                f"{path}: {k} appears twice. Ranks shard as "
+                f"eval_windows[rank::world_size] and the grid is fixed, so a "
+                f"key cannot collide unless the shard rule or the grid changed "
+                f"mid-run."
+            )
+        out[k] = row
+    return out
+
+
+def load_arm(base: Path, arm: str, step: int) -> dict[tuple, dict[str, Any]]:
+    """One arm's rows, ranks concatenated."""
+    paths = sorted(base.glob(f"{arm}_step{step}.rank*.jsonl"))
+    if not paths:
+        raise SystemExit(f"no {arm}_step{step}.rank*.jsonl under {base}")
+    merged: dict[tuple, dict[str, Any]] = {}
+    for path in paths:
+        for k, row in load(path).items():
+            if k in merged:
+                raise SystemExit(f"{path}: {k} already came from another rank")
+            merged[k] = row
+    return merged
+
+
+def check_pairing(arms: dict[str, dict[tuple, dict[str, Any]]]) -> list[tuple]:
+    """The shared keys, with "same key means same window" enforced."""
+    common = sorted(set.intersection(*(set(a) for a in arms.values())))
+    if not common:
+        raise SystemExit("no (window, sigma, noise) key is present in every arm")
+    ref_name = sorted(arms)[0]
+    ref = arms[ref_name]
+    for name, rows in arms.items():
+        bad = [k for k in common
+               if (rows[k]["sample_id"], rows[k]["stride"],
+                   rows[k]["target_frame"])
+               != (ref[k]["sample_id"], ref[k]["stride"], ref[k]["target_frame"])]
+        if bad:
+            raise SystemExit(
+                f"{name}: key {bad[:3]} names a different window than in "
+                f"{ref_name}. eval_seed must be 1234 and eval_windows must "
+                f"match in every arm; otherwise the arms are not paired and no "
+                f"difference below means anything."
+            )
+    for name, rows in arms.items():
+        extra = len(rows) - len(common)
+        if extra:
+            print(f"  note: {name} has {extra} rows outside the shared set")
+    return common
+
+
+def paired(a: dict[tuple, dict], b: dict[tuple, dict], keys: list[tuple],
+           metric: str) -> dict[str, float]:
+    """mean(a) - mean(b) over `keys`, with the *paired* standard error.
+
+    Paired, because the windows and the noise are shared: the standard error of
+    the mean difference is the spread of the per-key differences, which is far
+    smaller than either arm's own spread, and using the unpaired one would
+    throw away the reason the seeds are fixed.
+    """
+    diffs = [a[k][metric] - b[k][metric] for k in keys]
+    base = statistics.fmean(b[k][metric] for k in keys)
+    mean = statistics.fmean(diffs)
+    se = (statistics.stdev(diffs) / math.sqrt(len(diffs))
+          if len(diffs) > 1 else float("nan"))
+    return {
+        "n": len(diffs), "mean": mean, "base": base,
+        "rel": mean / base * 100.0 if base else float("nan"),
+        "se": se, "t": abs(mean) / se if se and se == se and se > 0 else float("nan"),
+    }
+
+
+def band_keys(rows: dict[tuple, dict], keys: list[tuple], band: str,
+              dt_bin: Optional[tuple[str, int, int]] = None) -> list[tuple]:
+    out = [k for k in keys if rows[k]["sigma_band"] == band]
+    if dt_bin is not None:
+        _, lo, hi = dt_bin
+        out = [k for k in out if lo <= rows[k]["stride"] <= hi]
+    return out
+
+
+def table(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
+          *, high: str, low: str, floor: Optional[tuple[str, str]],
+          metric: str, split_dt: bool = False) -> list[str]:
+    """One band-by-band table of `high - low`, against an optional floor."""
+    ref = arms[low]
+    head = (f"| 段 | {'Δt 箱 | ' if split_dt else ''}n | `{low}` | "
+            f"`{high}−{low}` | 配对SE | \\|t\\| | ")
+    head += "噪声底 | 底的SE | 比值 |" if floor else "|"
+    lines = [head, "|---|" + ("---|" if split_dt else "")
+             + "---:|---:|---:|---:|---:|"
+             + ("---:|---:|---:|" if floor else "")]
+    rows_out = []
+    for band in BANDS:
+        bins = list(DT_BINS) if split_dt else [None]
+        for b in bins:
+            ks = band_keys(ref, keys, band, b)
+            if not ks:
+                continue
+            eff = paired(arms[high], arms[low], ks, metric)
+            cell = (f"| {band} | " + (f"{b[0]} | " if split_dt else "")
+                    + f"{eff['n']} | {eff['base']:.4f} | "
+                    f"{eff['mean']:+.4f} ({eff['rel']:+.2f}%) | "
+                    f"±{eff['se']:.4f} | {eff['t']:.1f} | ")
+            if floor:
+                fl = paired(arms[floor[0]], arms[floor[1]], ks, metric)
+                ratio = (abs(eff["mean"]) / abs(fl["mean"])
+                         if fl["mean"] else float("inf"))
+                cell += (f"{abs(fl['mean']):.4f} ({abs(fl['rel']):.2f}%) | "
+                         f"±{fl['se']:.4f} | {ratio:.2f} |")
+                rows_out.append((band, b, eff, fl, ratio))
+            else:
+                cell += ""
+                rows_out.append((band, b, eff, None, None))
+            lines.append(cell)
+    return lines, rows_out
+
+
+def read_item1(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
+               names: dict[str, str]) -> list[str]:
+    """Section 6 item 1, with the verdict spelled out rather than left to a
+    reader comparing two columns."""
+    out: list[str] = []
+    for metric in ("loss_edm_weighted", "mse_aligned"):
+        out.append(f"\n### 第 1 条 · `{metric}`\n")
+        lines, rows = table(arms, keys, high=names["random"], low=names["zero"],
+                            floor=(names["zero"], names["floor"]),
+                            metric=metric)
+        out += lines
+        verdict = {}
+        for band, _, eff, fl, ratio in rows:
+            above = abs(eff["mean"]) > abs(fl["mean"])
+            verdict[band] = (above, eff["mean"] < 0, eff, fl)
+            if fl["t"] == fl["t"] and fl["t"] < 2.0:
+                out.append(
+                    f"\n> **{band} 段的噪声底没有从零分辨出来**（|t| = "
+                    f"{fl['t']:.1f} < 2），所以该段的「比值」是在除一个与零无法"
+                    f"区分的数，不可解读。")
+        hi = verdict.get("high")
+        lo = verdict.get("low")
+        if hi and lo:
+            if hi[0] and hi[1] and not lo[0]:
+                out.append("\n**判定：`h` 带历史信息** —— 高 σ 段超底且 "
+                           "`random` 更低，低 σ 段不超底（§6 第 1 条第一支）。")
+            elif all(v[0] for v in verdict.values()) and len(
+                    {v[1] for v in verdict.values()}) == 1:
+                out.append("\n**判定：读到的是容量** —— 三段同号同量级，"
+                           "如实写（§6 第 1 条第二支）。")
+            elif not hi[0]:
+                out.append("\n**判定：不可区分** —— 高 σ 段也不超底，"
+                           "去向由 §6 第 2 条的 oracle 门决定（第三支）。")
+            else:
+                out.append("\n**判定：三支都不完全吻合**，逐条写出上表再议；"
+                           "不要把它归到最近的一支。")
+    return out
+
+
+def read_item2(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
+               names: dict[str, str]) -> list[str]:
+    """Section 6 item 2: the oracle gate, both halves."""
+    need = ("oracle", "decoy", "random1", "zero1")
+    if not all(names.get(k) and names[k] in arms for k in need):
+        return ["\n### 第 2 条 · oracle 门\n",
+                "oracle / decoy / random-1gpu / zero-1gpu 尚未全部就位，跳过。"]
+    out = ["\n### 第 2 条 · oracle 门（`mse_aligned`，高 σ 段）\n"]
+    lines, _ = table(arms, keys, high=names["oracle"], low=names["random1"],
+                     floor=None, metric="mse_aligned")
+    out += lines
+    ks = band_keys(arms[names["random1"]], keys, "high")
+    gate = paired(arms[names["oracle"]], arms[names["random1"]], ks,
+                  "mse_aligned")
+    decoy = paired(arms[names["decoy"]], arms[names["random1"]], ks,
+                   "mse_aligned")
+    pipe = paired(arms[names["zero1"]], arms[names["random1"]], ks,
+                  "mse_aligned")
+    drop = -gate["rel"]
+    out.append(
+        f"\n- oracle 对 `random-1gpu` 的高 σ 段配对 MSE 变化："
+        f"**{gate['rel']:+.1f}%**（判据：下降 > 50%）"
+        f"\n- decoy 的同一数字：**{decoy['rel']:+.1f}%**；"
+        f"`|zero-1gpu − random-1gpu|` = **{abs(pipe['rel']):.1f}%**"
+        f"（判据：decoy 不超过它）")
+    passed_drop = drop > 50.0
+    passed_decoy = abs(decoy["rel"]) <= abs(pipe["rel"])
+    if passed_drop and passed_decoy:
+        out.append("\n**门通过：通路能带信息。** 去 §6 第 3 条。")
+    elif passed_drop and not passed_decoy:
+        out.append("\n**oracle 与 decoy 同量级下降 ⟹ 管道效应，读数作废，"
+                   "查管道**（§6 第 2 条第四行）。")
+    elif not passed_drop:
+        out.append("\n**门未通过：梯度到得了 `W_h` 却学不会读 —— 先验在抗。** "
+                   "直接去 P011（§6 第 2 条第三行）。中 σ 段与 "
+                   "`oracle-noaug` 的对照决定「共用旋转」是否列入必做。")
+    return out
+
+
+def identical(a: Path, b: Path) -> int:
+    """Byte-for-byte, and if not, which key moved and by how much."""
+    ta, tb = a.read_bytes(), b.read_bytes()
+    if ta == tb:
+        print(f"  [PASS] {a.name} and {b.name} are byte-identical "
+              f"({len(ta)} bytes)")
+        return 0
+    print(f"  [FAIL] {a.name} and {b.name} differ "
+          f"({len(ta)} vs {len(tb)} bytes)")
+    ra, rb = load(a), load(b)
+    only = (set(ra) ^ set(rb))
+    if only:
+        print(f"    {len(only)} keys in one file only, e.g. {sorted(only)[:3]}")
+    worst: dict[str, tuple[float, tuple]] = {}
+    for k in sorted(set(ra) & set(rb)):
+        for m in METRICS:
+            d = abs(ra[k][m] - rb[k][m])
+            if d > worst.get(m, (0.0, None))[0]:
+                worst[m] = (d, k)
+    for m, (d, k) in sorted(worst.items()):
+        print(f"    max |delta| {m:18s} = {d:.3e}  at {k}")
+    print("    a nonzero delta here is either the tool being "
+          "nondeterministic or the fusion point having moved; the per-key "
+          "magnitudes above say which (a handful of 1e-7 is arithmetic, a "
+          "uniform offset is not).")
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--runs", default="runs/p010/sigma_grid")
+    parser.add_argument("--step", type=int, default=2999)
+    parser.add_argument("--out", default="artifacts/reports/P010/readout.md")
+    parser.add_argument("--identical", nargs=2, metavar=("A", "B"),
+                        help="two jsonl paths to compare byte for byte")
+    # Arm names as they appear in the file names.  Defaults are P009's four at
+    # a checkpoint; the diagnostic arms are passed in once they exist.
+    parser.add_argument("--random", default="p009_random")
+    parser.add_argument("--zero", default="p009_zero")
+    parser.add_argument("--floor", default="p009_zero_seed2")
+    parser.add_argument("--none", default="p009_none")
+    parser.add_argument("--oracle", default="")
+    parser.add_argument("--decoy", default="")
+    parser.add_argument("--random1", default="")
+    parser.add_argument("--zero1", default="")
+    args = parser.parse_args()
+
+    if args.identical:
+        return identical(Path(args.identical[0]), Path(args.identical[1]))
+
+    base = Path(args.runs)
+    names = {k: getattr(args, k) for k in
+             ("random", "zero", "floor", "none", "oracle", "decoy",
+              "random1", "zero1")}
+    arms: dict[str, dict[tuple, dict]] = {}
+    for role, arm in names.items():
+        if not arm:
+            continue
+        if arm in arms:
+            continue
+        try:
+            arms[arm] = load_arm(base, arm, args.step)
+        except SystemExit as exc:
+            print(f"  [skip] {role} = {arm}: {exc}")
+            continue
+        print(f"  {role:8s} {arm:22s} {len(arms[arm])} rows")
+
+    required = [names["random"], names["zero"], names["floor"]]
+    if not all(r in arms for r in required):
+        print(f"\nthe reading needs {required}; have {sorted(arms)}. The floor "
+              f"arm is not optional -- without it there is nothing to compare "
+              f"an effect against.")
+        return 2
+
+    keys = check_pairing(arms)
+    print(f"  paired on {len(keys)} (window, sigma, noise) keys")
+
+    out = [f"# P010 逐 σ 读数（§6 的规则，step {args.step}）\n",
+           "判据在 `kineidos.read_sigma_grid` 里，跑之前就写好了。三段按 c_skip 切"
+           "（高 σ > 24.4 Å、中 5.3–24.4、低 < 5.3），各档在 "
+           "`(window_id, sigma, noise_idx)` 上配对。\n",
+           "| 角色 | 档 | 行数 |", "|---|---|---:|"]
+    for role, arm in names.items():
+        if arm and arm in arms:
+            out.append(f"| {role} | `{arm}` | {len(arms[arm])} |")
+    out += read_item1(arms, keys, names)
+    out += read_item2(arms, keys, names)
+
+    out.append("\n### 多报 · 三段 × 三箱 Δt（`loss_edm_weighted`）\n")
+    lines, _ = table(arms, keys, high=names["random"], low=names["zero"],
+                     floor=(names["zero"], names["floor"]),
+                     metric="loss_edm_weighted", split_dt=True)
+    out += lines
+
+    if names["none"] in arms:
+        out.append("\n### 多报 · 管道效应 `zero − none` 按段\n")
+        out.append("P009 §8 把它测成全程 +1.66%。若它也集中在高 σ 段，"
+                   "那么第 2 条里「decoy 不超过 |zero − random|」这一条的"
+                   "量级要按该段的值读，不是按全程的。\n")
+        lines, _ = table(arms, keys, high=names["zero"], low=names["none"],
+                         floor=None, metric="loss_edm_weighted")
+        out += lines
+
+    path = Path(args.out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out) + "\n")
+    print(f"\nwrote {path}")
+    print("\n".join(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
