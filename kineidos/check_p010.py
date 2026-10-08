@@ -378,10 +378,100 @@ def main() -> int:
 
     print("\n=== 6. the readout runs end to end on a synthetic fixture ===")
     check_readout_on_fixture()
+    print("\n=== 7. the gamma branch's own layer (D4) ===")
+    check_gamma_layer(cfg_root=make_configs(
+        "random", tempfile.mkdtemp(prefix="p010_check_gamma_cfg_")))
 
     print("\n" + "=" * 62)
     print("验收:", "全部通过" if not FAILS else f"{len(FAILS)} 项失败 -> {FAILS}")
     return 0 if not FAILS else 1
+
+
+def check_gamma_layer(*, cfg_root: Any) -> None:
+    """research/kineidos-v3-diag-gamma's half, which is never merged.
+
+    The release step is arithmetic and the mask's reach is a attribute walk, so
+    both fit here.  What needs a GPU -- that `p.grad = None` really stops AdamW
+    and that gamma therefore does not move -- is checked by arm A itself: its
+    gamma_rms is flat by construction, and if it decays the mask did nothing.
+    """
+    import torch
+
+    from kineidos.observables import read as read_observables
+    from kineidos.train.trainer import KineidosTrainer
+
+    check("wp.freeze_layernorm_until_step defaults to -1 (off)",
+          getattr(cfg_root.wp, "freeze_layernorm_until_step", "<<missing>>") == -1,
+          f"got {getattr(cfg_root.wp, 'freeze_layernorm_until_step', None)!r}; "
+          f"off by default is what makes section 6 item 5b's identity check "
+          f"possible at all")
+
+    def frozen_at(step: int, until: int) -> bool:
+        t = _ns(step=step, configs=_ns(wp=_ns(freeze_layernorm_until_step=until)))
+        return KineidosTrainer.gamma_is_frozen.__get__(t, _ns)
+
+    check("off (-1) is never frozen",
+          not any(frozen_at(s, -1) for s in (0, 1, 999, 1000, 1999)))
+    # Arm B: frozen through 999, released at 1000.  Section 6 item 3 reads the
+    # 500 steps after the release, so the boundary is the reading's left edge
+    # and an off-by-one puts the release outside the window.
+    b = [frozen_at(s, 1000) for s in (0, 999, 1000, 1001, 1999)]
+    check("arm B is frozen through 999 and released at 1000",
+          b == [True, True, False, False, False], str(b))
+    # Arm A passes a release step equal to MAX_STEPS, so the last step is still
+    # frozen -- which is what "frozen for the whole run" has to mean.
+    a = [frozen_at(s, 2000) for s in (0, 1000, 1999)]
+    check("arm A is frozen for the whole run", a == [True, True, True], str(a))
+
+    # The mask's reach, on a stand-in for the encoder rather than on a real
+    # model: what is being checked is that the attribute path is right, and
+    # that a path which finds nothing is fatal rather than silent.
+    enc = torch.nn.Module()
+    enc.wp_token_dim = 768
+    enc.wp_layernorm = torch.nn.LayerNorm(768)
+    enc.c_atom = 128
+    enc.wp_fusion = torch.nn.Linear(128 + 768, 128, bias=False)
+    holder = _ns(wp_token_dim=None,
+                 diffusion_module=_ns(atom_attention_encoder=enc))
+    t = _ns(raw_model=holder)
+    params = KineidosTrainer.layernorm_gamma_beta(t)
+    check("the mask finds gamma and beta", len(params) == 2,
+          f"{len(params)} tensors, "
+          f"{sum(p_.numel() for p_ in params)} values")
+    check("and they are wp_layernorm's",
+          all(any(p_ is q for q in (enc.wp_layernorm.weight,
+                                    enc.wp_layernorm.bias))
+              for p_ in params))
+    bare = _ns(raw_model=_ns(wp_token_dim=None,
+                             diffusion_module=_ns(atom_attention_encoder=None)))
+    check("and it finds nothing where there is no fusion",
+          KineidosTrainer.layernorm_gamma_beta(bare) == [])
+
+    # The failure this arm cannot afford silently: a mask covering nothing
+    # gives `random-1gpu` under another name, with a gamma curve that decays
+    # exactly like the baseline's.
+    nothing = _ns(raw_model=bare.raw_model,
+                  configs=_ns(wp=_ns(freeze_layernorm_until_step=2000,
+                                     mode="none")),
+                  print=print)
+    try:
+        KineidosTrainer.report_layernorm_mask(nothing)
+        check("a mask that covers nothing is fatal", False, "it was accepted")
+    except ValueError as exc:
+        check("a mask that covers nothing is fatal",
+              "another name" in str(exc), str(exc)[:70])
+
+    # gamma_rms, the number item 3 is read on, has to actually be logged.
+    with torch.no_grad():
+        enc.wp_layernorm.weight.fill_(0.5)
+        enc.wp_fusion.weight.zero_()
+    enc.wp_diagnostics = {"w_cl_norm": 1.0}
+    stats = read_observables(holder)
+    check("gamma_rms is an observable",
+          abs(stats.get("gamma_rms", -1) - 0.5) < 1e-6,
+          f"got {stats.get('gamma_rms')!r} for gamma = 0.5 everywhere")
+    check("and beta_rms with it", "beta_rms" in stats,
+          "D4 freezes both; a frozen gamma with a drifting beta is a back door")
 
 
 if __name__ == "__main__":
