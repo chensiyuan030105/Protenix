@@ -164,6 +164,35 @@ class KineidosTrainer(AF3Trainer):
             self.print(f"  (empty, frozen vacuously: "
                        f"{', '.join(report['parameter_free'])})")
         self.freeze_report = report
+        self.report_layernorm_mask()
+
+    def report_layernorm_mask(self) -> None:
+        """Say what D4's mask covers, at startup, including when it covers
+        nothing.
+
+        A mask that silently matched no parameter would give an arm that is
+        `random-1gpu` under another name, with a gamma curve that decays
+        exactly as the baseline's does -- and that is a result anyone would
+        read as "freezing gamma changed nothing".
+        """
+        until = int(self.configs.wp.freeze_layernorm_until_step)
+        params = self.layernorm_gamma_beta()
+        if until < 0:
+            self.print("gamma freeze: off (freeze_layernorm_until_step=-1), "
+                       "so this run is p010-base's code path exactly")
+            return
+        if not params:
+            raise ValueError(
+                f"freeze_layernorm_until_step={until} but no "
+                f"wp_layernorm.weight/.bias was found to freeze "
+                f"(wp.mode={self.configs.wp.mode!r}). An arm whose mask covers "
+                f"nothing is `random-1gpu` wearing another name, and its gamma "
+                f"curve would decay exactly like the baseline's -- which a "
+                f"reader would take as 'freezing gamma changed nothing'."
+            )
+        self.print(f"gamma freeze: {len(params)} tensors "
+                   f"({sum(p.numel() for p in params)} values) held still "
+                   f"until step {until}")
 
     # -------------------------------------------------------------- data
 
@@ -473,9 +502,74 @@ class KineidosTrainer(AF3Trainer):
 
     # -------------------------------------------------------------- loop
 
+    # ------------------------------------------------- gamma freeze (P010 D4)
+
+    def layernorm_gamma_beta(self) -> list[torch.nn.Parameter]:
+        """`wp_layernorm.weight` and `.bias`, or an empty list.
+
+        Empty in the `none` arm, where there is no fusion at all, and empty if
+        the encoder is not reachable -- so a misspelled attribute path turns
+        into "the mask froze nothing", which `freeze_report_layernorm` prints
+        and which the arm's own gamma curve would then contradict.  That is the
+        failure this arm cannot afford to have silently.
+        """
+        enc = observables.fusion_encoder(self.raw_model)
+        ln = getattr(enc, "wp_layernorm", None) if enc is not None else None
+        if ln is None:
+            return []
+        return [p for p in (getattr(ln, "weight", None),
+                            getattr(ln, "bias", None)) if p is not None]
+
+    @property
+    def gamma_is_frozen(self) -> bool:
+        until = int(self.configs.wp.freeze_layernorm_until_step)
+        return until >= 0 and self.step < until
+
+    def update(self) -> None:
+        """Clip as upstream does, then drop gamma and beta's gradients.
+
+        **After** super().update(), not before, and the order is the whole
+        design.  update() computes the global gradient norm and scales every
+        gradient by it, so dropping these two first would change the clip
+        factor for all the *other* parameters -- the arm would then differ from
+        `random-1gpu` in two ways instead of one.
+
+        `p.grad = None`, not `p.grad.zero_()`.  torch's AdamW skips a parameter
+        whose grad is None and does nothing else to it; given a zero gradient
+        it would still apply decoupled weight decay and still take an Adam step
+        from the stale moment buffers, so a "frozen" gamma would keep shrinking
+        -- which is the exact behaviour this arm exists to prevent.  Dropping
+        the gradient rather than clearing requires_grad is what keeps the two
+        parameters inside the optimizer, so that arm B can release them at step
+        1000 and have them move again; a parameter frozen by requires_grad
+        before init_scheduler never enters the optimizer at all
+        (kineidos/train/freezing.py's note on get_adamw) and could not be
+        released.
+        """
+        super().update()
+        if self.gamma_is_frozen:
+            for param in self.layernorm_gamma_beta():
+                param.grad = None
+
     def train_step(self, batch: dict[str, Any]) -> None:
+        was_frozen = self.gamma_is_frozen
         super().train_step(batch)
+        # The release, announced once.  Arm B's reading is "does gamma start
+        # falling again within 500 steps of here", so the step it happened at
+        # has to be in the log rather than inferred from the config.
+        if was_frozen and not self.gamma_is_frozen:
+            self.print(
+                f"[gamma] step {self.step}: wp_layernorm.weight/.bias released "
+                f"(freeze_layernorm_until_step="
+                f"{self.configs.wp.freeze_layernorm_until_step}); section 6 "
+                f"item 3 reads the next 500 steps"
+            )
         stats = observables.read(self.raw_model)
+        if stats:
+            # In the curve, not only in the log: a gamma_rms that stops moving
+            # and then moves again is only interpretable next to the flag that
+            # says when it was held.
+            stats["gamma_frozen"] = float(was_frozen)
         if not stats:
             return
         for key, value in stats.items():

@@ -536,6 +536,16 @@ kineidos_configs = {
         # global RNG", which is what a run that wants the global seed to govern
         # everything should use.
         "seed": -1,
+        # P010 D4, and only on research/kineidos-v3-diag-gamma: hold
+        # wp_layernorm's gamma and beta still while `step` is below this.
+        #
+        # -1 is off, and off is the default, so an arm that does not ask for
+        # the mask is bit-identical to p010-base (section 6, item 5b).  Arm A
+        # passes a value equal to MAX_STEPS -- frozen for the whole run -- and
+        # arm B passes 1000, which is the release step.  Written as a step
+        # number rather than a boolean plus a duration because the log line and
+        # the sbatch then say the same thing.
+        "freeze_layernorm_until_step": -1,
     },
     "kineidos": {
         "gagu_root": (
