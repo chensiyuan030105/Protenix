@@ -57,6 +57,43 @@ BINS = (("bin1", 1, 2, 0.23), ("bin2", 3, 5, 0.13), ("bin3", 6, 10, 0.07))
 METRIC = "loss"
 
 
+def refuse_oracle(run_dir: Path) -> None:
+    """Refuse a run that was fed the answer.  P010 D2, item 8.
+
+    P010's oracle arms hand the diffusion head a fixed random projection of the
+    target frame as `h`.  That is label leakage by construction -- it is the
+    point: the arm asks whether the pathway can carry information at all, and
+    its numbers are meaningless as a measure of anything else.  Those arms live
+    on a branch that is never merged (D2 item 9), which is the structural half
+    of the protection; this is the other half, because a *run directory* can be
+    copied anywhere and this file takes `--runs` as an argument.
+
+    Two tests, because either alone can be defeated by a rename: the directory
+    name, and `wp.mode` in the run's own env.lock.  A verdict is never produced
+    from a run that trips either.
+    """
+    if "oracle" in run_dir.name.lower():
+        raise SystemExit(
+            f"refusing to read {run_dir}: its name says oracle. The oracle "
+            f"arms are fed the target frame, so a held-out verdict built from "
+            f"them would be a measurement of the leak. They belong in P010's "
+            f"own readout, not in section 6.2's."
+        )
+    lock = run_dir / "env.lock"
+    if not lock.is_file():
+        return
+    try:
+        mode = json.loads(lock.read_text()).get("wp", {}).get("mode", "")
+    except (OSError, json.JSONDecodeError):
+        return
+    if "oracle" in str(mode).lower():
+        raise SystemExit(
+            f"refusing to read {run_dir}: env.lock records wp.mode={mode!r}. "
+            f"See the directory-name case above -- the mode is checked as well "
+            f"because a rename defeats either test alone."
+        )
+
+
 def find_run_dir(base: Path, prefix: str) -> Path | None:
     """The newest run directory for one arm.
 
@@ -67,7 +104,10 @@ def find_run_dir(base: Path, prefix: str) -> Path | None:
     pattern = re.compile(rf"^{re.escape(prefix)}_\d{{8}}_\d{{6}}$")
     hits = sorted((d for d in base.iterdir()
                    if d.is_dir() and pattern.match(d.name)), key=lambda d: d.name)
-    return hits[-1] if hits else None
+    if not hits:
+        return None
+    refuse_oracle(hits[-1])
+    return hits[-1]
 
 
 def load_rows(run_dir: Path) -> dict[int, dict[int, dict]]:

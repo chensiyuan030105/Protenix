@@ -120,8 +120,14 @@ class KineidosTrainer(AF3Trainer):
         self.print(f"env.lock -> {path}")
         for label, worktree in record["worktrees"].items():
             dirty = " [DIRTY]" if worktree["dirty"] else ""
+            # The tag as well as the hash.  P010 compares nine arms across
+            # three branches and the tag is what says an arm is comparable
+            # (p010-base / p010-oracle / p010-gamma); a hash in a log is not
+            # something a reader can place.
+            tags = worktree.get("tags") or []
+            tag = f" @{','.join(tags)}" if tags else ""
             self.print(f"  {label:12s} {str(worktree['commit'])[:12]} "
-                       f"({worktree['branch']}){dirty}")
+                       f"({worktree['branch']}){tag}{dirty}")
 
     # ------------------------------------------------------------- model
 
