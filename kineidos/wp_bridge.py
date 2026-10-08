@@ -12,6 +12,8 @@ rather than hunting through the training loop.
 
 from __future__ import annotations
 
+import hashlib
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -23,7 +25,24 @@ from kineidos.window_align import canonicalize_window
 
 # Plan section 4.  `none` and `zero` do not run WorldParticle at all, which is
 # what keeps the ablation's control arms independent of it.
-MODES = ("none", "zero", "random", "pretrained")
+#
+# `oracle` is P010's probe and exists only on
+# research/kineidos-v3-diag-oracle, which is never merged (D2 item 9).  It
+# hands the diffusion head a fixed random projection of the *answer* -- the
+# target frame, in the window's canonical pose -- and does not run
+# WorldParticle at all.  By construction it is label leakage; the question it
+# answers is whether the fusion pathway can carry information to the output,
+# which is a property of the pathway and of the pretrained denoiser's prior,
+# not of WorldParticle's features.  Its numbers are meaningless as a measure of
+# anything else and must never reach a figure or a table outside P010's own
+# readout.
+MODES = ("none", "zero", "random", "pretrained", "oracle")
+
+# The feature-dict key the oracle rides in.  Deliberately conspicuous and
+# deliberately not inside input_feature_dict's normal namespace (D2 items 1-2):
+# every mode but `oracle` raises if it finds this key, so a leak cannot travel
+# by a collate being left switched on.
+ORACLE_TARGET_KEY = "wp_oracle_target_nm"
 
 # cconv_embedding_dim 384 x factor 2.  factor is 2 rather than 3 because
 # uses_obstacle_features("molecular") is false -- we have no obstacle branch.
@@ -123,6 +142,8 @@ class WorldParticleBridge(nn.Module):
         checkpoint: Optional[str | Path] = None,
         time_channels: int = 1,
         seed: Optional[int] = None,
+        oracle_source: str = "",
+        oracle_seed: int = 20261008,
     ) -> None:
         super().__init__()
         if mode not in MODES:
@@ -132,6 +153,43 @@ class WorldParticleBridge(nn.Module):
         self.particle_radius_nm = float(particle_radius_nm)
         self.time_channels = int(time_channels)
         self.wp = None
+        self.oracle_seed: Optional[int] = None
+
+        if mode == "oracle":
+            from kineidos.data import windows
+
+            if oracle_source not in ("target", "decoy"):
+                raise ValueError(
+                    f"mode='oracle' needs oracle_source in ('target', "
+                    f"'decoy'), got {oracle_source!r}. 'decoy' is the negative "
+                    f"control and is not optional for a readable result "
+                    f"(P010 D2 item 6)."
+                )
+            self.oracle_seed = int(oracle_seed)
+            # Its own Generator, not the global RNG.  Drawing 2304 numbers from
+            # the global stream would shift every later draw -- the diffusion
+            # noise, the augmentation rotations -- so the oracle arm would stop
+            # being paired with the baseline for a reason that has nothing to
+            # do with the oracle.  Same hazard the fusion's own construction
+            # order was written around (transformer.py's note on building
+            # wp_layernorm last).
+            gen = torch.Generator().manual_seed(self.oracle_seed)
+            # 3 -> 768, unit-variance columns.  Full rank with probability one,
+            # so the target is linearly recoverable from h and the only thing
+            # standing between the oracle and a large effect is whether the
+            # pathway and the prior let the information through.  Scaled by
+            # 1/sqrt(3) so h's channel variance matches the input's rather than
+            # being three times it; wp_layernorm would absorb the scale anyway,
+            # but then the LayerNorm would be doing it rather than the design.
+            projection = torch.randn(3, TOKEN_DIM, generator=gen) / math.sqrt(3)
+            # A buffer, not a parameter: freeze_trunk makes every wp_bridge
+            # *parameter* trainable, and a learnable projection would let the
+            # arm reshape the answer instead of only transporting it.
+            self.register_buffer("oracle_projection", projection)
+            # Attaching the target to each window is the dataset's job, and the
+            # dataset is built in init_data -- after after_model_built, which is
+            # where this constructor runs, and before the dataloader forks.
+            windows.set_oracle_source(oracle_source)
 
         if mode in ("random", "pretrained"):
             # Imported here, not at module scope: `none` and `zero` must not
@@ -168,6 +226,27 @@ class WorldParticleBridge(nn.Module):
                     f"(conv0_molecular, dense0_molecular), so upstream weights "
                     f"need remapping rather than strict=False."
                 )
+
+    def oracle_provenance(self) -> dict[str, object]:
+        """What the oracle arm has to put in env.lock (D2 items 4 and 7).
+
+        The projection is generated rather than stored, so the seed is what
+        reproduces it -- and the digest is what proves the seed did.  Two runs
+        that claim the same seed and hash different matrices is a question
+        worth being able to ask.
+        """
+        if self.mode != "oracle":
+            return {}
+        from kineidos.data import windows
+
+        p = self.oracle_projection.detach().cpu().contiguous()
+        return {
+            "oracle_source": windows.oracle_source(),
+            "oracle_seed": self.oracle_seed,
+            "oracle_projection_shape": list(p.shape),
+            "oracle_projection_sha256": hashlib.sha256(
+                p.numpy().tobytes()).hexdigest(),
+        }
 
     # ---------------------------------------------------------------- checks
 
@@ -236,6 +315,20 @@ class WorldParticleBridge(nn.Module):
         must not contribute, and a plain mean over K would quietly average them
         in near the start of a trajectory.
         """
+        # D2 item 2, and first, before the early returns.  The oracle's key
+        # existing in a non-oracle arm means the collate was left switched on,
+        # which would make that arm's numbers unusable while looking entirely
+        # normal -- the loss would simply be a little better.
+        if self.mode != "oracle" and ORACLE_TARGET_KEY in feats:
+            raise KeyError(
+                f"{ORACLE_TARGET_KEY!r} is in the feature dict but wp.mode is "
+                f"{self.mode!r}. That key is the target frame -- the answer. "
+                f"Only the oracle probe may see it, and only on "
+                f"research/kineidos-v3-diag-oracle. Something left "
+                f"kineidos.data.windows.set_oracle_source switched on; find it "
+                f"rather than removing this check."
+            )
+
         missing = [k for k in WP_INPUT_KEYS if k not in feats]
         if self.mode != "none" and missing:
             raise KeyError(
@@ -251,6 +344,32 @@ class WorldParticleBridge(nn.Module):
             # Shaped like the real thing and carrying nothing. The fusion runs,
             # so this arm answers whether the pathway alone changes behaviour.
             return position.new_zeros((n_atom, self.token_dim))
+
+        if self.mode == "oracle":
+            target = feats.get(ORACLE_TARGET_KEY)
+            if target is None:
+                raise KeyError(
+                    f"mode='oracle' needs {ORACLE_TARGET_KEY!r} in the feature "
+                    f"dict; kineidos/train/batch.py puts it there when the "
+                    f"window carries it, and the window carries it when "
+                    f"kineidos.data.windows.set_oracle_source is on. The "
+                    f"constructor sets that, so an absent key means the bridge "
+                    f"was built after the dataset."
+                )
+            # Same check as the real path: the oracle is expressed in the
+            # window's canonical frame, so a window that something moved
+            # afterwards would put the two in different frames.
+            self.assert_window_canonical(feats)
+            if tuple(target.shape) != (n_atom, 3):
+                raise ValueError(
+                    f"the oracle target is {tuple(target.shape)} but this "
+                    f"window has {n_atom} atoms; these are the same atom set "
+                    f"in the same order or the projection is nonsense"
+                )
+            # h = x_target_canonical @ P, before wp_layernorm -- which is where
+            # the real path hands over too, so the two differ in what h is and
+            # in nothing else downstream.
+            return target.to(position.dtype) @ self.oracle_projection
 
         self.assert_window_canonical(feats)
 

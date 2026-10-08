@@ -29,7 +29,7 @@ from typing import Any
 
 import torch
 
-from kineidos.wp_bridge import wp_inputs_from_window
+from kineidos.wp_bridge import ORACLE_TARGET_KEY, wp_inputs_from_window
 
 # Keys chain_permutation.correct_symmetric_chains reads off label_full_dict
 # besides the coordinates (see its docstring).  They are per-atom annotations
@@ -50,6 +50,13 @@ def collate_window(window: Any) -> dict[str, Any]:
     # it inside forward rather than being called from outside, where DDP would
     # not reduce its gradients.
     feats.update(wp_inputs_from_window(window))
+    # P010's oracle probe (research/kineidos-v3-diag-oracle only).  Conditional
+    # on the window actually carrying one, so that in every other arm the key
+    # is absent rather than present-and-None -- the bridge raises on its mere
+    # presence, which is the point (D2 item 2), and that check needs a clean
+    # absence to be meaningful.
+    if getattr(window, "oracle_target_nm", None) is not None:
+        feats[ORACLE_TARGET_KEY] = window.oracle_target_nm.clone()
 
     label_dict = {k: v.clone() for k, v in window.labels.items()}
     label_full_dict = {k: v.clone() for k, v in window.labels.items()}
