@@ -96,6 +96,21 @@ if [ -n "${MISSING}" ]; then
   exit 1
 fi
 
+# Same precondition as p010_identity.sbatch, checked before anything is
+# submitted: an arm on a tree that is not DIAG plus one layer is an arm whose
+# baseline is not the one the other arms share.
+for tree in "${ORACLE}" "${GAMMA}"; do
+  if ! git -C "${tree}" merge-base --is-ancestor \
+       "$(git -C "${DIAG}" rev-parse HEAD)" HEAD 2>/dev/null; then
+    echo "refusing to submit: ${tree} is not a descendant of ${DIAG}'s HEAD." >&2
+    echo "  Behind by $(git -C "${tree}" rev-list --count \
+         "HEAD..$(git -C "${DIAG}" rev-parse HEAD)" 2>/dev/null || echo '?')" \
+         "commits. Rebase it first -- nine arms cannot share a baseline that" >&2
+    echo "  two of the trees do not contain." >&2
+    exit 1
+  fi
+done
+
 for tree in "${DIAG}" "${ORACLE}" "${GAMMA}"; do
   if [ -n "$(git -C "${tree}" status --porcelain)" ]; then
     echo "refusing to submit: ${tree} is dirty. An arm's env.lock would say" >&2

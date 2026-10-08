@@ -123,6 +123,39 @@ fi
 echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
 echo "TREES=${TREES}"
 echo "BASE_TREE=${BASE_TREE} WP_MODE=${WP_MODE} MAX_STEPS=${MAX_STEPS}"
+# The precondition the comparison has no meaning without: each test tree must
+# be the integration tree **plus one layer**, not a cousin of it.
+#
+# Nothing checked this, and it cost two runs of this job.  On 2026-10-08 the
+# oracle and gamma worktrees were 20 commits behind diag -- far enough back
+# that they did not contain kineidos/determinism.py at all, so
+# `determinism.enable()` was a no-op there and the job compared one
+# deterministic run against two nondeterministic ones.  The report said
+# "**差异**" for both branches with max |delta| up to 1.3 on loss_unweighted,
+# 200x the forward-only envelope, every one of them at sigma 24.4 or 45.7 --
+# which reads exactly like "the branches changed the computation" and was
+# entirely my own branch staleness.
+#
+# D10's "共用基线的条件" is that a test branch reduces to p010-base with its
+# switch off.  That cannot be true of a branch which does not contain
+# p010-base.  `merge-base --is-ancestor` is that sentence in one command.
+for TREE in ${TREES}; do
+  [ "${TREE}" = "${BASE_TREE}" ] && continue
+  if ! git -C "${TREE}" merge-base --is-ancestor HEAD "${BASE_TREE}" 2>/dev/null \
+     && ! git -C "${TREE}" merge-base --is-ancestor \
+          "$(git -C "${BASE_TREE}" rev-parse HEAD)" HEAD 2>/dev/null; then
+    BEHIND=$(git -C "${TREE}" rev-list --count \
+             "HEAD..$(git -C "${BASE_TREE}" rev-parse HEAD)" 2>/dev/null || echo "?")
+    echo "拒绝比较：$(basename "${TREE}") 不是 $(basename "${BASE_TREE}") HEAD 的后代" >&2
+    echo "  落后 ${BEHIND} 个 commit。先 rebase：" >&2
+    echo "    git -C ${TREE} rebase --onto $(git -C "${BASE_TREE}" rev-parse --abbrev-ref HEAD) \\" >&2
+    echo "      \$(git -C ${TREE} merge-base $(git -C "${BASE_TREE}" rev-parse --abbrev-ref HEAD) HEAD)" >&2
+    echo "  一个落后的分支和基线之间的任何差异都解释不了——它既可能是开关" >&2
+    echo "  的代码，也可能是它缺的那些 commit。" >&2
+    exit 1
+  fi
+done
+
 NGPU_WANT=1
 # shellcheck source=./p010_preflight.sh
 source "${BASE_TREE}/kineidos/slurm/p010_preflight.sh"
