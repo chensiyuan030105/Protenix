@@ -29,6 +29,7 @@ from configs.configs_model_type import model_configs
 from protenix.config import parse_configs
 from protenix.utils.distributed import DIST_WRAPPER
 
+from kineidos import determinism
 from kineidos.train.trainer import KineidosTrainer, wp_token_dim_for
 
 # Undo protenix/data/pipeline/data_pipeline.py:36, which runs at import and sets
@@ -121,6 +122,12 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         filemode="w",
     )
+    # Before the model is built and before any data is drawn, because
+    # use_deterministic_algorithms changes which kernels get selected.  Off
+    # unless KINEIDOS_DETERMINISTIC is set; see kineidos/determinism.py for
+    # why the training path needs it too, and for what it cannot promise about
+    # the backward.
+    determinism.enable()
     configs = build_configs(parse_sys_args())
     model_name = configs.model_name
     wp_mode = configs.wp.mode

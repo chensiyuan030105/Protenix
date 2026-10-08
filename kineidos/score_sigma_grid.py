@@ -96,6 +96,7 @@ import torch
 
 from protenix.utils.distributed import DIST_WRAPPER
 
+from kineidos import determinism
 from kineidos.seeding import set_all_seeds
 
 # The training draw's own parameters, as constants to derive the grid from.
@@ -459,49 +460,8 @@ def arm_matches_state(state: dict[str, Any], mode: str) -> None:
         )
 
 
-def enable_determinism() -> list[str]:
-    """Ask torch for deterministic kernels, and report what it cannot give.
-
-    Scoring the same arm twice on the same GPU is not bit-reproducible: the
-    measured envelope is 1.5e-04 on loss_edm_weighted and 5.2e-03 on
-    mse_aligned (jobs 2149391 / 2149412, deep-chungus-1, same device).  That
-    is 400x below the band effects section 6 reads, so the readings stand --
-    but section 4's acceptance asks for "逐位一致", and an acceptance that the
-    hardware cannot satisfy is not an acceptance.
-
-    `warn_only=True` rather than raising, because the point of this switch is
-    diagnostic: it lists the operations with no deterministic implementation
-    instead of stopping at the first one.  Those names are the answer to "is
-    this the tool or the model" -- AF3 aggregates atoms into tokens with a
-    segment sum, and a CUDA scatter-add uses atomics, whose summation order is
-    not reproducible.
-
-    Off unless KINEIDOS_DETERMINISTIC is set, so the normal path keeps the
-    faster kernels.  CUBLAS_WORKSPACE_CONFIG has to be in the environment
-    before the first cuBLAS handle is created, so the sbatch exports it rather
-    than this function setting it.
-    """
-    import os
-    import warnings
-
-    if os.environ.get("KINEIDOS_DETERMINISTIC", "") not in ("1", "true", "True"):
-        return []
-    if not os.environ.get("CUBLAS_WORKSPACE_CONFIG"):
-        print("[determinism] CUBLAS_WORKSPACE_CONFIG is unset, so cuBLAS "
-              "reductions stay nondeterministic however this is configured; "
-              "the sbatch must export it before python starts", flush=True)
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.backends.cudnn.benchmark = False
-    print(f"[determinism] on; cuBLAS workspace="
-          f"{os.environ.get('CUBLAS_WORKSPACE_CONFIG', '<unset>')}", flush=True)
-    caught: list[str] = []
-    warnings.filterwarnings("always", category=UserWarning)
-    return caught
-
-
 def main() -> int:
     import logging
-    import warnings
 
     from protenix.config import parse_sys_args
 
@@ -513,7 +473,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)-7s %(message)s",
         level=logging.INFO, datefmt="%H:%M:%S")
 
-    enable_determinism()
+    determinism.enable()
     configs = build_configs(parse_sys_args())
     cfg = configs.kineidos
     target = cfg.score_checkpoint
@@ -556,24 +516,12 @@ def main() -> int:
                       f"arm {configs.wp.mode!r}")
     trainer.step = step
 
-    # Collect, then report once.  A nondeterminism warning fires per call, so
-    # printing them as they arrive would bury the scoring log under 11,264
-    # copies of the same sentence.
-    seen: dict[str, int] = {}
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        arm_out = _score_and_report(trainer, configs, cfg, step)
-    for w in caught:
-        text = str(w.message).split("\n")[0][:160]
-        if "does not have a deterministic implementation" in str(w.message) \
-                or "nondeterministic" in str(w.message).lower():
-            seen[text] = seen.get(text, 0) + 1
-    if seen:
-        print("[determinism] operations with no deterministic implementation, "
-              "which is where the run-to-run spread comes from:", flush=True)
-        for text, count in sorted(seen.items(), key=lambda kv: -kv[1]):
-            print(f"  {count:6d}x  {text}", flush=True)
-    return arm_out
+    # Nondeterminism warnings are filtered to "once" by determinism.enable(),
+    # which is shared with the training entry point -- an earlier version
+    # collected and counted them here, which worked only on this path and held
+    # up to 11,264 warning objects to report a fact the first one already
+    # states.
+    return _score_and_report(trainer, configs, cfg, step)
 
 
 def _score_and_report(trainer, configs, cfg, step) -> int:

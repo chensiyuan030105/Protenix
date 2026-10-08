@@ -127,8 +127,25 @@ NGPU_WANT=1
 # shellcheck source=./p010_preflight.sh
 source "${BASE_TREE}/kineidos/slurm/p010_preflight.sh"
 
+# Defined before the run loop, because the loop uses it to decide what it can
+# skip.  Anchored on the timestamp init_basics appends: a bare prefix would
+# make `...-diag` match `...-diag-oracle`.
+newest () { ls -d "${OUT}"/identity_"$1"_[0-9]*_[0-9]* 2>/dev/null | sort | tail -1; }
+
 for TREE in ${TREES}; do
   LABEL=$(basename "${TREE}")
+  # Idempotent, and not as an optimisation.  On 2026-10-08 job 2149625 ran all
+  # three trees to completion -- 26 minutes of GPU -- and then died in the
+  # *comparison*.  A rerun has to be able to reach the comparison without
+  # paying for the runs again, or a bug in the reporting costs the measurement.
+  EXISTING=$(newest "${LABEL}")
+  if [ -n "${EXISTING}" ] && [ "${FORCE:-0}" != "1" ] \
+     && ls "${EXISTING}"/heldout/*.jsonl >/dev/null 2>&1 \
+     && ls "${EXISTING}"/sigma_grid/*.jsonl >/dev/null 2>&1; then
+    echo ""
+    echo "=== ${LABEL}: already run ($(basename "${EXISTING}")); FORCE=1 to redo ==="
+    continue
+  fi
   echo ""
   echo "=== ${LABEL} ==="
   # A per-tree base_dir, and no resume_dir at all: resuming one tree's
@@ -177,10 +194,15 @@ done
 export PYTHONPATH="${BASE_TREE}:repos/research/wp-v2"
 BASE_LABEL=$(basename "${BASE_TREE}")
 
-newest () { ls -d "${OUT}"/identity_"$1"_[0-9]*_[0-9]* 2>/dev/null | sort | tail -1; }
-
 BASE_DIR=$(newest "${BASE_LABEL}")
 [ -n "${BASE_DIR}" ] || { echo "no run directory for ${BASE_LABEL}" >&2; exit 1; }
+
+# %x in the --output template is the job name *as submitted*, which the command
+# line can override -- so this is derived from SLURM_JOB_NAME, never spelled
+# out.  Spelling it out is what killed 2149625: the file was
+# p010-acc-identity-2149625.err because --job-name said so.
+LOG="${WORKSPACE}/runs/slurm/${SLURM_JOB_NAME:-p010-identity}-${SLURM_JOB_ID:-none}.err"
+[ -f "${LOG}" ] || echo "note: no ${LOG}, so the train-loss column reads '?'" >&2
 
 {
   echo "# P010 §6 第 5 条 (b)：恒等检查"
@@ -196,7 +218,7 @@ BASE_DIR=$(newest "${BASE_LABEL}")
   echo "一步跑完三个模型都没动过，检查会通过而根本没测到梯度路径"
   echo "（见 \`kineidos/train/check_trainer.py\` 第 5 节）。"
   echo
-  echo "| 树 | 运行目录 | 逐窗口 jsonl | 逐 σ jsonl | 训练 loss 行 |"
+  echo "| 树 | 运行目录 | 逐窗口 jsonl | 逐 σ jsonl | step-1 训练 loss |"
   echo "|---|---|---|---|---|"
 } > "${REPORT}"
 
@@ -235,7 +257,26 @@ for TREE in ${TREES}; do
   done
   # The training-side half.  The eval rows only exercise the forward pass; the
   # periodic metrics line is where the backward and the optimizer show up.
-  a=$(grep -h "train metrics:" "${WORKSPACE}/runs/slurm/p010-identity-${SLURM_JOB_ID:-none}.err" 2>/dev/null | head -4 | md5sum | cut -c1-8)
+  #
+  # Rewritten after it killed job 2149625 -- three faults in one line:
+  #
+  #   * the log path was hardcoded as "p010-identity-", while the file is
+  #     named after %x, the actual job name.  grep on a missing file exits 2,
+  #     pipefail propagated it and `set -e` ended the job -- *after* all three
+  #     trees had run.
+  #   * `head` in a pipe under pipefail is the SIGPIPE hazard AGENTS.md warns
+  #     about.
+  #   * and it said nothing even when it worked: one md5 over four lines of a
+  #     log that interleaves all three trees gives every row the same hash.
+  #
+  # Now it takes the lines belonging to *this* tree -- each log line carries
+  # the tree's own path -- and reports its last train loss, which a reader can
+  # compare.  And every substitution ends in `|| true`: the comparison is this
+  # job's payload, so a cosmetic column must not be able to fail it.
+  a=$( { grep -h "/${LABEL}/runner/train.py" "${LOG}" 2>/dev/null \
+         | grep -oE "'train/loss.avg': np.float64\([0-9.]+" \
+         | awk 'END{print}' | grep -oE "[0-9.]+$" ; } || true )
+  a="${a:-?}"
   echo "| \`${LABEL}\` | \`$(basename "${DIR}")\` | ${HO} | ${SG} | ${a} |" >> "${REPORT}"
   case "${HO}${SG}" in *差异*|*缺*) FAILED="${FAILED} ${LABEL}";; esac
 done
