@@ -93,7 +93,20 @@ def load(path: Path) -> dict[tuple[int, float, int], dict[str, Any]]:
 
 
 def load_arm(base: Path, arm: str, step: int) -> dict[tuple, dict[str, Any]]:
-    """One arm's rows, ranks concatenated."""
+    """One arm's rows, ranks concatenated, with every window complete.
+
+    The completeness check is not pedantry.  A `background` preemption kills
+    the scorer mid-arm and leaves a jsonl holding whatever it had written --
+    on 2026-10-08 two such files sat in runs/p010/sigma_grid next to two
+    complete ones, at 3659 and 3720 rows against 11264.  A truncated arm reads
+    as a complete arm over a smaller window set, which silently shrinks the
+    paired set for *every* arm and moves every number in the table.
+
+    The scorer writes row by row within a window, so a kill lands inside one:
+    that window has fewer than len(sigmas) x n_noise rows, and the whole grid
+    is present for every other window.  Refusing on an incomplete window
+    catches the truncation at the only place it is visible.
+    """
     paths = sorted(base.glob(f"{arm}_step{step}.rank*.jsonl"))
     if not paths:
         raise SystemExit(f"no {arm}_step{step}.rank*.jsonl under {base}")
@@ -103,11 +116,42 @@ def load_arm(base: Path, arm: str, step: int) -> dict[tuple, dict[str, Any]]:
             if k in merged:
                 raise SystemExit(f"{path}: {k} already came from another rank")
             merged[k] = row
+
+    per_window: dict[int, int] = collections.Counter(
+        k[0] for k in merged)
+    sigmas = {k[1] for k in merged}
+    noises = {k[2] for k in merged}
+    full = len(sigmas) * len(noises)
+    short = sorted(w for w, c in per_window.items() if c != full)
+    if short:
+        raise SystemExit(
+            f"{arm} step {step}: window(s) {short[:3]} carry "
+            f"{[per_window[w] for w in short[:3]]} rows, not the "
+            f"{len(sigmas)} sigmas x {len(noises)} noise = {full} the rest do. "
+            f"That is a scoring that was killed part way -- `background` has no "
+            f"grace period and the file holds whatever had been written. Rerun "
+            f"the arm (the sweep skips arms with a .done marker, so it will "
+            f"redo only this one); do not read a truncated arm as a complete "
+            f"one over fewer windows, which would shrink the paired set for "
+            f"every arm."
+        )
     return merged
 
 
-def check_pairing(arms: dict[str, dict[tuple, dict[str, Any]]]) -> list[tuple]:
+def check_pairing(arms: dict[str, dict[tuple, dict[str, Any]]],
+                  *, allow_ragged: bool = False) -> list[tuple]:
     """The shared keys, with "same key means same window" enforced."""
+    sizes = {name: len({k[0] for k in rows}) for name, rows in arms.items()}
+    if len(set(sizes.values())) > 1 and not allow_ragged:
+        raise SystemExit(
+            f"the arms scored different numbers of windows: "
+            f"{dict(sorted(sizes.items(), key=lambda kv: kv[1]))}. Either an "
+            f"arm is missing rounds, or kineidos.sigma_grid_windows differed "
+            f"between them -- both are legitimate (a mid-training round may "
+            f"score a prefix of the set) and both change what the table is "
+            f"over, so say which with --allow-ragged rather than having it "
+            f"decided by whichever arm was shortest."
+        )
     common = sorted(set.intersection(*(set(a) for a in arms.values())))
     if not common:
         raise SystemExit("no (window, sigma, noise) key is present in every arm")
@@ -369,7 +413,10 @@ def main() -> int:
     parser.add_argument("--step", type=int, default=2999)
     parser.add_argument("--out", default="artifacts/reports/P010/readout.md")
     parser.add_argument("--identical", nargs=2, metavar=("A", "B"),
-                        help="two jsonl paths to compare byte for byte")
+                        help="two jsonl paths to compare field by field")
+    parser.add_argument("--allow-ragged", action="store_true",
+                        help="accept arms that scored different numbers of "
+                             "windows, and read over the intersection")
     # Arm names as they appear in the file names.  Defaults are P009's four at
     # a checkpoint; the diagnostic arms are passed in once they exist.
     parser.add_argument("--random", default="p009_random")
@@ -409,7 +456,7 @@ def main() -> int:
               f"an effect against.")
         return 2
 
-    keys = check_pairing(arms)
+    keys = check_pairing(arms, allow_ragged=args.allow_ragged)
     print(f"  paired on {len(keys)} (window, sigma, noise) keys")
 
     out = [f"# P010 逐 σ 读数（§6 的规则，step {args.step}）\n",
