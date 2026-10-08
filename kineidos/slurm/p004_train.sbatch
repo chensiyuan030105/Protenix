@@ -62,7 +62,12 @@
 # 追加而非覆盖。requeue 复用作业 ID，默认的覆盖模式会抹掉重排前的全部日志——
 # 包括抢占本身的证据，于是连"为什么重启了"都查不到。
 #SBATCH --open-mode=append
-#SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-8,deep-gpu-10,deep-gpu-11
+# deep-chungus-7's GPU 7 is broken; see AGENTS.md's 已知坏卡 and
+# kineidos/slurm/p010_bench.sbatch for the measurements.  A requeued arm
+# must not land on it: this template's startup check asks
+# torch.cuda.is_available(), which may answer True on a card whose kernels
+# then fail, and the arm would simply be "the slow one".
+#SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-7,deep-chungus-8,deep-gpu-10,deep-gpu-11
 # One task; torchrun forks one process per GPU inside it.  --gres and --mem are
 # passed on the sbatch command line so NGPU can vary without editing this file.
 #SBATCH --nodes=1

@@ -24,7 +24,28 @@
 #SBATCH --account=grad-students
 #SBATCH --requeue
 #SBATCH --open-mode=append
-#SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-8,deep-gpu-10,deep-gpu-11
+# Excluded, and each name is a measured failure rather than a precaution:
+#   deep-h-1/-2/-3  broken GPUs (nvidia-smi itself cannot get a device handle,
+#                   while slurm happily allocates gres:gpu:1 -- three P009
+#                   jobs ran to completion on CPU before this was noticed)
+#   deep-chungus-7  **GPU 7 is broken** (AGENTS.md's 已知坏卡, 2026-10-07 on):
+#                   nvidia-smi reports a healthy, empty A100 80GB and both the
+#                   visibility and the memory check pass, but the CUDA runtime
+#                   fails to initialise in-process.  P006 measured 12 ns/day
+#                   against a sibling's 173 on the same node, exit code 0, log
+#                   clean; and in one 54-task array, 35 tasks were rejected by
+#                   the startup check and every one of them was on that card.
+#                   A card that fails or crawls stays *idle on slurm's books*,
+#                   so the scheduler keeps feeding it -- a bad card pumps an
+#                   array dry.  --gres cannot name a device, so the node goes.
+#                   Our preflight's third safeguard allocates and multiplies,
+#                   which catches it; excluding the node saves the queue slot.
+#   deep-chungus-8, deep-gpu-10/-11  DOWN+NOT_RESPONDING
+#   deep-chungus-6  IDLE with no GPU at all
+#   deep-chungus-3/-4/-5  our own P006 GROMACS array has their CPUs at load
+#                   38-74, and load tracks step time cleanly (4-6.5 -> 6-7.7
+#                   s/it, 33 -> 14.1)
+#SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-3,deep-chungus-4,deep-chungus-5,deep-chungus-6,deep-chungus-7,deep-chungus-8,deep-gpu-10,deep-gpu-11
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=02:00:00
