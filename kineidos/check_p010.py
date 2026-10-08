@@ -454,6 +454,12 @@ def check_gamma_layer(*, cfg_root: Any) -> None:
                   configs=_ns(wp=_ns(freeze_layernorm_until_step=2000,
                                      mode="none")),
                   print=print)
+    # report_layernorm_mask calls self.layernorm_gamma_beta(), so the stand-in
+    # needs it bound rather than merely available on the class -- the first
+    # version of this check raised AttributeError and the script died before
+    # the assertion it was making.
+    nothing.layernorm_gamma_beta = (
+        KineidosTrainer.layernorm_gamma_beta.__get__(nothing, _ns))
     try:
         KineidosTrainer.report_layernorm_mask(nothing)
         check("a mask that covers nothing is fatal", False, "it was accepted")
