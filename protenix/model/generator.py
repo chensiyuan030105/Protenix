@@ -350,6 +350,36 @@ def sample_diffusion_training(
         dtype
     )  # [..., N_sample, N_atom, 3]
 
+    # Kineidos (P010, research/kineidos-v3-diag-oracle only -- the single
+    # change this branch makes under protenix/).  The `oracle-noaug` arm takes
+    # the rotation to the identity and the translation to zero, which is what
+    # centre_only does.
+    #
+    # Why the arm exists: the loss is SE(3) invariant (loss.py's Kabsch runs
+    # before the MSE), so a network output in the canonical frame is scored
+    # correctly -- but D = c_skip*x_noisy + c_out*F adds the network's output to
+    # the *augmented* input, and each of the N_sample copies carries its own
+    # random pose while h is computed once and broadcast.  At high sigma c_skip
+    # is small and the sum is almost all F, so a canonical-frame answer works;
+    # in the middle band the two terms must agree on a frame, and the network
+    # would have to register x_noisy against h to get there.  Turning the
+    # augmentation off removes that obstacle and nothing else, so it separates
+    # "the pathway cannot carry this" from "the pathway can, but only where
+    # c_skip is small".
+    #
+    # The discarded draw above is deliberate.  centre_only consumes no RNG, so
+    # skipping the call would shift every later draw -- the noise, and on the
+    # training side the recycling and dropout -- and `oracle-noaug` would stop
+    # being paired with `oracle` for a reason unrelated to the augmentation.
+    # The cost is one wasted rotation per step.
+    if not getattr(denoise_net, "augment_target", True):
+        x_gt_augment = centre_random_augmentation(
+            x_input_coords=label_dict["coordinate"],
+            N_sample=N_sample,
+            mask=label_dict["coordinate_mask"],
+            centre_only=True,
+        ).to(dtype)
+
     # Add independent noise to each structure
     # sigma: independent noise-level [..., N_sample]
     sigma = noise_sampler(size=(*batch_size_shape, N_sample), device=device).to(dtype)

@@ -492,6 +492,27 @@ kineidos_configs = {
         # global RNG", which is what a run that wants the global seed to govern
         # everything should use.
         "seed": -1,
+        # P010's oracle probe, and only on research/kineidos-v3-diag-oracle.
+        #
+        # "" is off and is the default, so every arm that does not ask for the
+        # probe builds the same windows and runs the same code as p010-base.
+        # "target" feeds the model the frame it is being asked to predict;
+        # "decoy" feeds a random frame of the same trajectory at least 50 ns
+        # away, which has the same statistics and no information (D2 item 6).
+        # mode='oracle' requires one of the two -- there is no default, because
+        # a default would decide for the reader which experiment ran.
+        "oracle_source": "",
+        # The projection is generated from this rather than stored, so this
+        # number plus the sha256 in env.lock is what reproduces h exactly
+        # (D2 item 7).
+        "oracle_seed": 20261008,
+        # D-a / section 1's nuance: whether the *target frame* gets AF3's random
+        # rotation and translation before noise is added.  True is current
+        # behaviour and the default.  The `oracle-noaug` arm sets it false, to
+        # ask whether the mid-sigma band is blocked by the skip connection and
+        # the network output being in different frames -- which is a real
+        # obstacle there and not one at high sigma, where c_skip is small.
+        "target_augmentation": True,
     },
     "kineidos": {
         "gagu_root": (

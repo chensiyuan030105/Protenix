@@ -80,6 +80,29 @@ class KineidosTrainer(AF3Trainer):
         super().init_log()
         self.write_env_lock()
 
+    def append_env_lock(self, extra: dict[str, Any]) -> None:
+        """Merge more facts into an env.lock that has already been written.
+
+        init_log runs before init_model (runner/train.py:66-67), so the bridge
+        does not exist when write_env_lock runs and the oracle's seed and the
+        digest of its projection cannot be in the first write.  Rewriting is
+        the honest fix; deferring the whole lock until after the model is built
+        would mean a crash during construction leaves no lock at all.
+        """
+        import json
+
+        if DIST_WRAPPER.rank != 0:
+            return
+        path = os.path.join(self.run_dir, "env.lock")
+        try:
+            with open(path) as handle:
+                record = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            record = {}
+        record.update(extra)
+        with open(path, "w") as handle:
+            handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
     def write_env_lock(self) -> None:
         """Pin what this run actually ran, inside the run's own directory.
 
@@ -153,8 +176,33 @@ class KineidosTrainer(AF3Trainer):
             particle_radius_nm=cfg.particle_radius_nm,
             checkpoint=cfg.checkpoint or None,
             seed=cfg.seed if cfg.seed >= 0 else None,
+            oracle_source=cfg.oracle_source,
+            oracle_seed=cfg.oracle_seed,
         )
         self.raw_model.wp_bridge = bridge.to(self.device)
+        # P010 D-a.  Read by sample_diffusion_training off the denoise net,
+        # which is the only change this branch makes under protenix/; set here
+        # so that the switch lives in our config rather than in theirs.
+        self.raw_model.diffusion_module.augment_target = bool(
+            cfg.target_augmentation)
+        if not cfg.target_augmentation:
+            self.print("target-frame augmentation: OFF (rotation = identity, "
+                       "translation = 0, in training and in eval)")
+        provenance = bridge.oracle_provenance()
+        if provenance:
+            # D2 items 3 and 4.  Loud, at startup, and again at every
+            # evaluation round: this arm is fed the answer, and a log that does
+            # not shout about it is how its numbers end up quoted somewhere
+            # else six weeks later.
+            self.print("=" * 70)
+            self.print("ORACLE ARM: h is a fixed random projection of the "
+                       "TARGET FRAME. This is label leakage by construction.")
+            for key, value in sorted(provenance.items()):
+                self.print(f"  {key} = {value}")
+            self.print("Never merge this branch; never quote these numbers "
+                       "outside P010's own readout (D2 items 5 and 9).")
+            self.print("=" * 70)
+            self.append_env_lock({"wp_oracle": provenance})
 
         report = freeze_trunk(self.raw_model,
                               trainable=("diffusion_module", "wp_bridge"))
@@ -515,6 +563,16 @@ class KineidosTrainer(AF3Trainer):
         SmoothLDDTLoss is the one the training objective uses -- writing a second
         alignment here is how a metric ends up measuring something else (8).
         """
+        if self.configs.wp.mode == "oracle":
+            # D2 item 3.  Every round, not once: these lines are what a reader
+            # skimming a log for the eval numbers will see next to them.
+            self.print(
+                f"[ORACLE] step {self.step}: this arm's held-out loss is "
+                f"scored with the target frame fed in as h "
+                f"(oracle_source={self.configs.wp.oracle_source!r}). It is a "
+                f"measurement of the pathway, not of any model anyone could "
+                f"run. Do not compare it to P009's arms."
+            )
         if not self.eval_windows:
             self.print(
                 f"[eval] step {self.step}: no held-out windows configured "

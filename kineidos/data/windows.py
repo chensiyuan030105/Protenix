@@ -37,7 +37,10 @@ arbitrary orientation into the conditioning signal.
 
 from __future__ import annotations
 
+import math
+import zlib
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -58,6 +61,73 @@ DT_MIN_NS = 0.1
 # training windows and the held-out windows together.  A range set per dataset
 # would make the held-out loss measure a different problem than the one trained.
 DT_MAX_NS = 1.0
+
+
+# P010's oracle probe, and only on research/kineidos-v3-diag-oracle.
+#
+# "" is off and is the default, so every other arm builds exactly the windows
+# p010-base builds -- byte for byte, because the code below is not merely
+# equivalent when this is empty, it is not entered at all.
+#
+# "target" attaches the frame the window is asking the model to predict, in the
+# window's own canonical frame.  That is the answer, and handing it to the
+# model is the point: section 6 item 2 asks whether the fusion pathway can
+# carry information to the output at all, which is a question about the pathway
+# and not about WorldParticle.
+#
+# "decoy" attaches a random frame of the same trajectory at least
+# ORACLE_DECOY_MIN_GAP_NS away, where the autocorrelation has long since
+# decayed (tau_half = 0.35 ns on GAGU, so 50 ns is ~143 half-lives).  Same
+# statistics, same path, same projection, zero information -- which is what
+# separates "the pathway carries information" from "the pathway being busy
+# changes the loss".  P009 measured the latter at +1.66% for `zero` against
+# `none`, so it is not a hypothetical.
+#
+# Set by WorldParticleBridge's constructor, which runs in after_model_built --
+# before init_data builds the datasets, and before the dataloader forks its
+# workers, so the workers inherit it.
+_ORACLE_SOURCE = ""
+ORACLE_SOURCES = ("", "target", "decoy")
+ORACLE_DECOY_MIN_GAP_NS = 50.0
+
+
+def set_oracle_source(source: str) -> None:
+    """Choose what the oracle probe attaches to each window, or turn it off."""
+    global _ORACLE_SOURCE
+    if source not in ORACLE_SOURCES:
+        raise ValueError(f"oracle source must be one of {ORACLE_SOURCES}, "
+                         f"got {source!r}")
+    _ORACLE_SOURCE = source
+
+
+def oracle_source() -> str:
+    return _ORACLE_SOURCE
+
+
+def decoy_frame_for(sample, target_frame: int, stride: int,
+                    *, min_gap_ns: float = ORACLE_DECOY_MIN_GAP_NS) -> int:
+    """A frame of the same trajectory far enough away to carry nothing.
+
+    Deterministic in (sample_id, target_frame, stride) through crc32, not
+    through `hash`: PYTHONHASHSEED is random per process, so `hash` would give
+    a different decoy in every dataloader worker and in every rerun, and the
+    arm would not be paired with anything -- including itself.
+    """
+    gap = int(math.ceil(min_gap_ns / sample.frame_interval_ns))
+    before = np.arange(0, max(target_frame - gap + 1, 0))
+    after = np.arange(min(target_frame + gap, sample.n_frames), sample.n_frames)
+    choices = np.concatenate([before, after])
+    if choices.size == 0:
+        raise ValueError(
+            f"{sample.sample_id} has {sample.n_frames} frames at "
+            f"{sample.frame_interval_ns} ns, so no frame is {min_gap_ns} ns "
+            f"away from frame {target_frame}. A decoy closer than that is "
+            f"correlated with the target and the negative control would be a "
+            f"weak positive one."
+        )
+    key = f"{sample.sample_id}:{target_frame}:{stride}".encode()
+    rng = np.random.default_rng(zlib.crc32(key))
+    return int(rng.choice(choices))
 
 
 @dataclass
@@ -97,6 +167,18 @@ class Window:
 
     features: dict[str, torch.Tensor]        # Protenix, Angstroms
     labels: dict[str, torch.Tensor]          # Protenix, Angstroms
+
+    # P010's oracle probe.  None in every other arm, and the collate only puts
+    # a key in the feature dict when it is not None, so the bridge's "this key
+    # must not exist outside oracle mode" check has nothing to trip over.
+    #
+    # Nanometres and in the window's canonical frame: the same units and the
+    # same pose as wp_position_nm, because `h` is defined on the canonicalised
+    # window (plan section 2.9.3) and an oracle in a different frame would be
+    # asking the model to learn a rotation on top of the thing being tested.
+    oracle_target_nm: Optional[torch.Tensor] = None     # [N, 3]
+    oracle_source_used: str = ""
+    oracle_frame: Optional[int] = None
 
 
 def sample_delta_t_ns(rng: np.random.Generator,
@@ -235,8 +317,46 @@ def build_window(
         features=features,
         labels=labels,
     )
+    if _ORACLE_SOURCE:
+        attach_oracle_target(window, sample, frames[0], canonicalize)
     assert_atom_order(sample, window)
     return window
+
+
+def attach_oracle_target(window: Window, sample, anchor_frame: int,
+                         canonicalize: bool) -> None:
+    """Put the oracle's source frame into the window, in the window's own pose.
+
+    The transform has to be *the same* one the history got, or the oracle is
+    expressed in a frame the model would first have to find.  It is recovered
+    rather than passed around: canonicalize_window takes its rotation and both
+    centroids from frame 0 of whatever array it is given (and nothing else), so
+    calling it again on [history frame 0, source frame] reproduces that
+    transform exactly and transports the source frame through it.
+
+    Done as a second call rather than by appending the source frame to the main
+    array, which would have been cheaper by one 3x3 SVD.  The reason is section
+    6 item 5b: with the probe off this function is not called, and with it on
+    the main canonicalisation is untouched, so "the oracle branch with the
+    probe off is bit-identical to p010-base" holds by construction instead of
+    resting on a claim about gemm determinism over a differently shaped array.
+    """
+    source = _ORACLE_SOURCE
+    frame = (window.target_frame if source == "target"
+             else decoy_frame_for(sample, window.target_frame, window.stride))
+    if canonicalize:
+        pair = np.stack([sample.position_nm[anchor_frame],
+                         sample.position_nm[frame]]).astype(np.float64)
+        aligned, _, _ = canonicalize_window(pair, None, sample.ref_pos_nm())
+        coords = aligned[1]
+    else:
+        # No canonicalisation anywhere in this window, so the oracle must not
+        # be canonicalised either -- it has to share the history's frame, not
+        # be in the "right" one.
+        coords = sample.position_nm[frame].astype(np.float64)
+    window.oracle_target_nm = torch.from_numpy(coords.copy()).float()
+    window.oracle_source_used = source
+    window.oracle_frame = int(frame)
 
 
 def assert_atom_order(sample, window: Window) -> None:
