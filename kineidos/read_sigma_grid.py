@@ -488,7 +488,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--runs", default="runs/p010/sigma_grid")
     parser.add_argument("--step", type=int, default=2999)
-    parser.add_argument("--out", default="artifacts/reports/P010/readout.md")
+    # Not readout.md: that is section 6 item 6's hand-written report, which
+    # cites these tables.  This file is regenerated and overwritten.
+    parser.add_argument("--out",
+                        default="artifacts/reports/P010/sigma_tables.md")
     parser.add_argument("--identical", nargs=2, metavar=("A", "B"),
                         help="two jsonl paths to compare field by field")
     parser.add_argument("--allow-ragged", action="store_true",

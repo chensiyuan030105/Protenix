@@ -37,7 +37,11 @@ ENV="/mnt/xfs/home/mhg/anaconda3/envs/kineidos-v2-slurm"
 MODE="${MODE:-read}"
 STEP="${STEP:-2999}"
 RUNS="${RUNS:-${WORKSPACE}/runs/p010/sigma_grid}"
-OUT="${OUT:-${WORKSPACE}/artifacts/reports/P010/readout.md}"
+# Step-stamped, and not readout.md.  This file is regenerated on every run and
+# overwritten; section 6 item 6's report is written by hand, cites these
+# tables and must not be clobbered by a rerun.  Keeping the two apart is also
+# what lets the tables be regenerated freely as arms land.
+OUT="${OUT:-${WORKSPACE}/artifacts/reports/P010/sigma_tables_step${STEP}.md}"
 
 mkdir -p "${WORKSPACE}/runs/slurm" "$(dirname "${OUT}")"
 cd "${WORKSPACE}"
