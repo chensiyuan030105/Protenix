@@ -69,6 +69,13 @@ export TRIANGLE_MULTIPLICATIVE="${TRIANGLE_MULTIPLICATIVE:-cuequivariance}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
+# Both halves of torch's determinism story, and both have to be here rather
+# than in python: cuBLAS reads its workspace configuration when the first
+# handle is created, which is before any line of ours runs.
+export KINEIDOS_DETERMINISTIC="${KINEIDOS_DETERMINISTIC:-0}"
+if [ "${KINEIDOS_DETERMINISTIC}" = "1" ]; then
+  export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+fi
 
 echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
 echo "TREE=${TREE} STEP=${STEP} OUT=${OUT} ARMS=${ARMS}"
