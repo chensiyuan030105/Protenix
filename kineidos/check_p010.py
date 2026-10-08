@@ -398,6 +398,34 @@ def check_oracle_layer(*, cfg_root: Any) -> None:
         check("a non-oracle mode refuses the oracle key",
               "answer" in str(exc), str(exc)[:70])
 
+    # The positive test, and the gap it fills is specific: section 6 item 5b
+    # runs this branch in `random` mode, so none of the oracle code executes
+    # there.  "Off equals base" cannot say anything about "on works", and the
+    # arms were the oracle path's first real execution -- which is how a dtype
+    # mismatch got three minutes into two of them.
+    #
+    # Under autocast, because that is the condition that broke it: the bridge
+    # is called inside autocast(bfloat16) while its output is consumed with
+    # autocast disabled, so an h that inherits the ambient dtype is wrong by
+    # construction.
+    feats_ok = {
+        "wp_position_nm": torch.zeros(8, 5, 3),
+        "wp_velocity_nm_per_ps": torch.zeros(8, 5, 3),
+        "wp_frame_time_ns": torch.zeros(8),
+        "wp_frame_mask": torch.ones(8, dtype=torch.bool),
+        "wp_ref_pos_nm": torch.zeros(5, 3),
+        "wp_canonicalized": torch.tensor(False),
+        ORACLE_TARGET_KEY: torch.zeros(5, 3),
+    }
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        h = a(feats_ok)
+    check("oracle h is [N, 768]", tuple(h.shape) == (5, 768), str(tuple(h.shape)))
+    check("and float32 even under autocast(bfloat16)",
+          h.dtype == torch.float32,
+          f"got {h.dtype}; the fusion's weights are float32 and the diffusion "
+          f"head runs with autocast disabled (skip_amp), so a bf16 h fails in "
+          f"_fuse_wp_tokens -- which is what killed jobs 2149800/2149801")
+
     # And the oracle mode refuses to run without it, rather than silently
     # falling back to something.
     try:
