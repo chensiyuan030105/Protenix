@@ -71,6 +71,52 @@ def eval_rounds(max_steps: int, eval_interval: int) -> list[int]:
     return rounds
 
 
+def check_no_empty_args() -> None:
+    """No `--key ""` in any P010 submission script.
+
+    An empty value cannot survive protenix's command line.  parse_sys_args
+    builds the argument string as `f"{k} {v} "` and parse_configs splits it on
+    whitespace, so an empty v leaves its key with nothing after it and shifts
+    every later pair by one.  The symptom is argparse's "expected one
+    argument", ten seconds in.
+
+    A one-second static check because the cost is not the ten seconds.  On
+    2026-10-08 job 2149587 died this way *after* the 33-minute acceptance it
+    depended on had passed, and took four queued arms with it as
+    DependencyNeverSatisfied -- so the price of one empty string was the whole
+    chain's latency plus a resubmission.  The right place to catch an argument
+    that can never work is before anything is submitted.
+
+    The value to pass instead is no flag at all: every config key has a
+    default, and for the keys where "" is the meaningful value -- resume_dir,
+    sigma_grid_out, sigma_grid_arm -- "" *is* the default.
+    """
+    import re
+    from pathlib import Path
+
+    slurm = Path(__file__).resolve().parent / "slurm"
+    bad: list[str] = []
+    scanned = 0
+    # `--key ""` and `--key ''`, with the quotes adjacent: a quoted empty
+    # string is the only way to write this that bash will pass through as an
+    # empty argv entry.
+    pattern = re.compile(r"(--[A-Za-z0-9_.-]+)\s+([\"']{2})(?=\s|\\|$)")
+    for path in sorted(slurm.glob("p010_*")):
+        text = path.read_text()
+        scanned += 1
+        for line in text.splitlines():
+            stripped = line.strip()
+            # Usage comments carry example command lines; they are
+            # documentation, not what runs.
+            if stripped.startswith("#"):
+                continue
+            for key, _ in pattern.findall(line):
+                bad.append(f"{path.name}: {key} \"\"")
+    check(f"{scanned} P010 scripts pass no empty values", not bad,
+          "; ".join(bad) if bad else
+          "an empty value shifts every later --key/value pair by one")
+
+
 def check_readout_on_fixture() -> None:
     """Drive kineidos.read_sigma_grid over four tiny arms.
 
@@ -258,7 +304,10 @@ def main() -> int:
     except SystemExit as exc:
         check("and a real arm still passes", False, str(exc)[:80])
 
-    print("\n=== 5. the readout runs end to end on a synthetic fixture ===")
+    print("\n=== 5. no sbatch passes an empty value on the command line ===")
+    check_no_empty_args()
+
+    print("\n=== 6. the readout runs end to end on a synthetic fixture ===")
     check_readout_on_fixture()
 
     print("\n" + "=" * 62)

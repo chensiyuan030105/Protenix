@@ -116,9 +116,19 @@ for TREE in ${TREES}; do
   LABEL=$(basename "${TREE}")
   echo ""
   echo "=== ${LABEL} ==="
-  # A per-tree base_dir, and a resume_dir that must NOT be shared: resuming
-  # one tree's checkpoint into another is exactly the confound this job is
-  # looking for, and leaving resume_dir empty is how that is ruled out.
+  # A per-tree base_dir, and no resume_dir at all: resuming one tree's
+  # checkpoint into another is exactly the confound this job looks for, and the
+  # config default for kineidos.resume_dir is already "" -- which disables
+  # resume.
+  #
+  # Omitted rather than passed as "".  An empty value cannot survive the
+  # command line at all: parse_sys_args builds `f"{k} {v} "` and parse_configs
+  # splits that on whitespace, so an empty v leaves the key with nothing after
+  # it *and shifts every later key/value pair by one*.  This cost 33 minutes of
+  # chain latency on 2026-10-08 -- job 2149587 died in ten seconds with
+  # "argument --kineidos.resume_dir: expected one argument", after the 33-minute
+  # acceptance it depended on had already passed, and took four queued arms
+  # with it as DependencyNeverSatisfied.  The hard error was the lucky case.
   export PYTHONPATH="${TREE}:repos/research/wp-v2"
   "${ENV}/bin/python" -u -m kineidos.train.main \
     --wp.mode "${WP_MODE}" \
@@ -139,7 +149,6 @@ for TREE in ${TREES}; do
     --loss.weight.alpha_distogram 0.0 \
     --kineidos.train_samples "${TRAIN_SAMPLES}" \
     --kineidos.num_workers 0 \
-    --kineidos.resume_dir "" \
     --kineidos.held_out_samples "${HELD_OUT}" \
     --kineidos.eval_windows "${EVAL_WINDOWS}" \
     --kineidos.sigma_grid true \
