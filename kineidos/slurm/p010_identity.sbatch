@@ -69,7 +69,10 @@ EVAL_WINDOWS="${EVAL_WINDOWS:-64}"
 SIGMA_NOISE="${SIGMA_NOISE:-4}"
 SEED="${SEED:-42}"
 OUT="${OUT:-${WORKSPACE}/runs/p010/identity}"
-REPORT="${REPORT:-${WORKSPACE}/artifacts/reports/P010/identity_check.md}"
+# Job-stamped, and not identity_check.md: that one is section 6 item 5b's
+# hand-written verdict, which cites these tables.  This file is regenerated
+# and overwritten -- the same separation readout.md needed.
+REPORT="${REPORT:-${WORKSPACE}/artifacts/reports/P010/identity_check_job${SLURM_JOB_ID:-none}.md}"
 
 GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/processed/gagu_internal_loop_v0_1"
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-$({ ls -d ${GAGU_ROOT}/*_r[123] 2>/dev/null || true; } | xargs -r -n1 basename | paste -sd,)}"
