@@ -301,10 +301,12 @@ def per_sigma(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
     loss weights by and the grid does not, which is the whole reason the two
     can disagree on the same checkpoint.
     """
+    from kineidos.score_sigma_grid import P_MEAN, P_STD, SIGMA_DATA
+
     sigmas = sorted({k[1] for k in keys})
     sigma_data = SIGMA_DATA
     lines = [f"| σ (Å) | z | 段 | c_skip | 训练抽样占比 | n | `{low}` | "
-             f"`{high}−{low}` | 配对SE | \|t\| | "
+             + rf"`{high}−{low}` | 配对SE | \|t\| | "
              + ("噪声底 | 比值 |" if floor else "|"),
              "|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|"
              + ("---:|---:|" if floor else "")]
@@ -312,8 +314,7 @@ def per_sigma(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
     # the weights sum to one over the grid's span.  Not a claim that the grid
     # is a quadrature rule -- it is here so a reader can see which rows the
     # held-out average is actually made of.
-    zs = [math.log(sig / sigma_data) for sig in sigmas]
-    zs = [(z - P_MEAN) / P_STD for z in zs]
+    zs = [(math.log(sig / sigma_data) - P_MEAN) / P_STD for sig in sigmas]
     edges = [-math.inf] + [(a + b) / 2 for a, b in zip(zs, zs[1:])] + [math.inf]
     def phi(z: float) -> float:
         return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
