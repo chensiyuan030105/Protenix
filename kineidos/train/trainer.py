@@ -32,7 +32,7 @@ import torch
 
 from protenix.utils.distributed import DIST_WRAPPER
 
-from kineidos import observables
+from kineidos import atomic, observables
 from kineidos.seeding import set_all_seeds
 from kineidos.checkpoint import FUSION_KEYS, load_checkpoint
 from kineidos.train.batch import collate_fn_window
@@ -114,9 +114,15 @@ class KineidosTrainer(AF3Trainer):
             "alpha_distogram": self.configs.loss.weight.alpha_distogram,
             "alpha_diffusion": self.configs.loss.weight.alpha_diffusion,
         }
-        path = os.path.join(self.run_dir, "env.lock")
-        with open(path, "w") as handle:
-            handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        # Atomic, for the same reason as everything else this project writes:
+        # `background` preempts with no grace period.  A half-written env.lock
+        # is worse than an absent one -- it is invalid JSON, so every reader
+        # that parses it (read_heldout's oracle refusal, the resume provenance
+        # gate) falls through its JSONDecodeError handler and reports the run
+        # as unverifiable, which is indistinguishable from a run that was
+        # never locked.  See kineidos/atomic.py.
+        path = Path(self.run_dir) / "env.lock"
+        atomic.write_json(path, record)
         self.print(f"env.lock -> {path}")
         for label, worktree in record["worktrees"].items():
             dirty = " [DIRTY]" if worktree["dirty"] else ""
@@ -687,6 +693,14 @@ class KineidosTrainer(AF3Trainer):
         # rank writes here.
         out.mkdir(parents=True, exist_ok=True)
         path = out / f"step_{self.step}.rank{DIST_WRAPPER.rank}.jsonl"
-        with open(path, "w") as handle:
+        # Atomic.  These rows are what P009 section 6.2's verdict is computed
+        # from, and read_heldout.load_rows reads whatever lines are present
+        # with no completeness check -- so a round cut short by a preemption
+        # would read as a complete round over fewer windows.  Today that is
+        # caught only because read_heldout compares window sets across arms
+        # and raises when they differ, which needs at least one arm to have
+        # survived the same preemption.  Writing aside and renaming removes
+        # the condition rather than relying on a sibling.
+        with atomic.atomic_open(path) as handle:
             for row in rows:
                 handle.write(json.dumps(row, sort_keys=True) + "\n")
