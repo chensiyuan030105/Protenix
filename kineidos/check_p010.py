@@ -309,10 +309,150 @@ def main() -> int:
 
     print("\n=== 6. the readout runs end to end on a synthetic fixture ===")
     check_readout_on_fixture()
+    print("\n=== 7. the oracle branch's own layer (D2) ===")
+    check_oracle_layer(cfg_root=make_configs(
+        "random", tempfile.mkdtemp(prefix="p010_check_oracle_cfg_")))
 
     print("\n" + "=" * 62)
     print("验收:", "全部通过" if not FAILS else f"{len(FAILS)} 项失败 -> {FAILS}")
     return 0 if not FAILS else 1
+
+
+def check_oracle_layer(*, cfg_root: Any) -> None:
+    """research/kineidos-v3-diag-oracle's half, which is never merged.
+
+    Everything here is CPU and seconds: a 3x768 matrix, a frame index, and the
+    guard raising.  What it cannot check is that the probe is *off* by default
+    in a real window -- that needs a trajectory, and p010_identity.sbatch is
+    where it is checked, bit for bit against p010-base.
+    """
+    import hashlib
+
+    import torch
+
+    from kineidos.data import windows
+    from kineidos.train.trainer import wp_token_dim_for
+    from kineidos.wp_bridge import (MODES, ORACLE_TARGET_KEY,
+                                    WorldParticleBridge)
+
+    wp = cfg_root.wp
+    for key, want, why in (
+        ("oracle_source", "",
+         "a default would decide for the reader which experiment ran"),
+        ("oracle_seed", 20261008, "this number plus the sha256 reproduces h"),
+        ("target_augmentation", True, "True is current behaviour"),
+    ):
+        got = getattr(wp, key, "<<missing>>")
+        check(f"wp.{key} defaults to {want!r}", got == want,
+              f"got {got!r}; {why}")
+
+    check("'oracle' is a mode", "oracle" in MODES, str(MODES))
+    check("and it gets the fusion's width",
+          wp_token_dim_for("oracle") == 768, str(wp_token_dim_for("oracle")))
+
+    # D2 item 6: the negative control is not optional, so the mode refuses to
+    # be built without saying which of the two it is.
+    try:
+        WorldParticleBridge("oracle")
+        check("oracle without a source is refused", False, "it was accepted")
+    except ValueError as exc:
+        check("oracle without a source is refused",
+              "decoy" in str(exc), str(exc)[:70])
+
+    # D2 item 7: the projection is generated, so the seed is what reproduces it
+    # and the digest is what proves the seed did.
+    a = WorldParticleBridge("oracle", oracle_source="target", oracle_seed=7)
+    b = WorldParticleBridge("oracle", oracle_source="decoy", oracle_seed=7)
+    c = WorldParticleBridge("oracle", oracle_source="target", oracle_seed=8)
+    check("the projection is 3 -> 768",
+          tuple(a.oracle_projection.shape) == (3, 768),
+          str(tuple(a.oracle_projection.shape)))
+    check("the same seed gives the same projection",
+          torch.equal(a.oracle_projection, b.oracle_projection))
+    check("a different seed gives a different one",
+          not torch.equal(a.oracle_projection, c.oracle_projection))
+    prov = a.oracle_provenance()
+    digest = hashlib.sha256(
+        a.oracle_projection.detach().cpu().contiguous().numpy().tobytes()
+    ).hexdigest()
+    check("oracle_provenance's digest is of that matrix",
+          prov.get("oracle_projection_sha256") == digest,
+          str(prov.get("oracle_projection_sha256"))[:16])
+    check("and it carries the seed and the source",
+          prov.get("oracle_seed") == 7 and "oracle_source" in prov, str(prov))
+    # It is a buffer, so freeze_trunk cannot make it trainable and the arm
+    # cannot reshape the answer -- only transport it.
+    check("the projection is a buffer, not a parameter",
+          not any(p_.shape == a.oracle_projection.shape
+                  for p_ in a.parameters()),
+          f"{len(list(a.parameters()))} parameters on an oracle bridge")
+
+    # D2 item 2, the guard that makes item 5 structural: every other mode
+    # raises on the mere presence of the key.
+    guarded = WorldParticleBridge("zero")
+    try:
+        guarded({ORACLE_TARGET_KEY: torch.zeros(4, 3)})
+        check("a non-oracle mode refuses the oracle key", False,
+              "it was accepted")
+    except KeyError as exc:
+        check("a non-oracle mode refuses the oracle key",
+              "answer" in str(exc), str(exc)[:70])
+
+    # And the oracle mode refuses to run without it, rather than silently
+    # falling back to something.
+    try:
+        a({"wp_position_nm": torch.zeros(8, 4, 3),
+           "wp_velocity_nm_per_ps": torch.zeros(8, 4, 3),
+           "wp_frame_time_ns": torch.zeros(8),
+           "wp_frame_mask": torch.ones(8, dtype=torch.bool),
+           "wp_ref_pos_nm": torch.zeros(4, 3),
+           "wp_canonicalized": torch.tensor(False)})
+        check("oracle mode refuses to run without the key", False,
+              "it was accepted")
+    except KeyError as exc:
+        check("oracle mode refuses to run without the key",
+              ORACLE_TARGET_KEY in str(exc), str(exc)[:70])
+
+    print("  (the constructor set windows.oracle_source() = "
+          f"{windows.oracle_source()!r}; resetting it)")
+    windows.set_oracle_source("")
+    try:
+        windows.set_oracle_source("answer")
+        check("an unknown oracle source is refused", False, "it was accepted")
+    except ValueError as exc:
+        check("an unknown oracle source is refused",
+              "target" in str(exc), str(exc)[:60])
+
+    # The decoy's gap and its determinism.  GAGU is 10000 frames at 0.1 ns, so
+    # 50 ns is 500 frames and every target has somewhere to go.
+    sample = _ns(sample_id="gagu_fake_r4", frame_interval_ns=0.1,
+                 n_frames=10000)
+    gaps = []
+    for target in (0, 250, 5000, 9999):
+        f = windows.decoy_frame_for(sample, target, 4)
+        gaps.append(abs(f - target) * sample.frame_interval_ns)
+        again = windows.decoy_frame_for(sample, target, 4)
+        if f != again:
+            check(f"decoy for target {target} is deterministic", False,
+                  f"{f} then {again}")
+    check("every decoy is at least 50 ns from its target",
+          all(g >= 50.0 for g in gaps),
+          ", ".join(f"{g:.0f} ns" for g in gaps))
+    check("the decoy is deterministic in (sample, target, stride)", True,
+          "crc32, not hash -- PYTHONHASHSEED is per process")
+    check("a different stride gives a different decoy",
+          windows.decoy_frame_for(sample, 5000, 4)
+          != windows.decoy_frame_for(sample, 5000, 40),
+          "two windows ending on the same frame are different examples")
+    # A trajectory too short to have anywhere to put the decoy must say so,
+    # not quietly pick a correlated frame.
+    short = _ns(sample_id="short", frame_interval_ns=0.1, n_frames=300)
+    try:
+        windows.decoy_frame_for(short, 150, 4)
+        check("a trajectory with no room refuses", False, "it returned a frame")
+    except ValueError as exc:
+        check("a trajectory with no room refuses",
+              "50" in str(exc) or "correlated" in str(exc), str(exc)[:60])
 
 
 if __name__ == "__main__":
