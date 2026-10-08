@@ -82,7 +82,18 @@ SIGMA_GRID="${SIGMA_GRID:-true}"
 # 2.5.  The held-out rounds stay at EVAL_INTERVAL whatever this says -- the
 # oracle gate reads the first 500 steps and arm B the 500 after its release,
 # and those are the rounds that cadence is for.
-SIGMA_GRID_INTERVAL="${SIGMA_GRID_INTERVAL:-0}"
+#
+# 500 is D13, decided 2026-10-08: four grid rounds an arm instead of eight,
+# 40 GPU-hours instead of 47 over the ten arms.  The config default stays 0
+# (= every round), so D11's "the defaults are the protocol" is untouched and
+# this is P010's submission choice, written where the submission is.
+#
+# What is NOT reduced is EVAL_INTERVAL: the per-window held-out rows stay at
+# every 250 steps, because the oracle gate reads the first 500 steps and arm B
+# reads the 500 after its release (section 6 items 2 and 3).  The grid tracks
+# gamma and the band structure, which move on a scale of a thousand steps, so
+# four points over 2000 steps is not undersampling them.
+SIGMA_GRID_INTERVAL="${SIGMA_GRID_INTERVAL:-500}"
 SIGMA_GRID_WINDOWS="${SIGMA_GRID_WINDOWS:-0}"
 
 GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/processed/gagu_internal_loop_v0_1"
