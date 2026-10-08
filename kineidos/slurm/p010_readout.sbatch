@@ -74,6 +74,23 @@ if [ "${MODE}" = "check" ]; then
   exit "${RC}"
 fi
 
+# P009 section 6.2's own read, at a step the per-sigma grid also scored.  The
+# cross-check the grid makes necessary: it aggregates eleven grid points with
+# equal weight, while the held-out loss averages 48 sigmas *drawn from the
+# training distribution* -- 53% of that draw lands in the low band and 14% in
+# the high one.  The two therefore weight the bands differently, and if they
+# disagree in sign on the same checkpoint, that is a fact about the weighting
+# and has to be known before section 6 item 2 is read, not after.
+#
+# Writes to a P010 path.  P009's own readout.md is its section 6.2 verdict and
+# is not ours to overwrite.
+if [ "${MODE}" = "heldout" ]; then
+  exec "${ENV}/bin/python" -u -m kineidos.read_heldout \
+    --step "${STEP}" \
+    --out "${HELDOUT_OUT:-${WORKSPACE}/artifacts/reports/P010/p009_heldout_step${STEP}.md}" \
+    "$@"
+fi
+
 # shellcheck disable=SC2086
 exec "${ENV}/bin/python" -u -m kineidos.read_sigma_grid \
   --runs "${RUNS}" \
