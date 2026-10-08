@@ -282,6 +282,60 @@ def read_item1(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
     return out
 
 
+def per_sigma(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
+              *, high: str, low: str, floor: Optional[tuple[str, str]],
+              metric: str) -> list[str]:
+    """One row per grid point, which is what the three bands average over.
+
+    The bands are section 6's registered cut and stay the verdict, but they can
+    hide the shape inside themselves.  The high band holds only two grid points
+    -- z = 1.5 and z = 2.0, sigma 45.7 and 96.8 -- while the training draw puts
+    most of its high-band mass near z = 1.1-1.5, so the band mean over-weights
+    the extreme tail by construction.  If a band effect turns out to live
+    entirely at sigma 96.8, that is 2.3% of the draw and a noise level at which
+    a 470-atom RNA is not a structure any more; the band table alone cannot say
+    so.
+
+    Also reported: `w`, each grid point's share of the training draw, as the
+    Gaussian mass of the z-interval it stands for.  It is what the held-out
+    loss weights by and the grid does not, which is the whole reason the two
+    can disagree on the same checkpoint.
+    """
+    sigmas = sorted({k[1] for k in keys})
+    sigma_data = SIGMA_DATA
+    lines = [f"| σ (Å) | z | 段 | c_skip | 训练抽样占比 | n | `{low}` | "
+             f"`{high}−{low}` | 配对SE | \|t\| | "
+             + ("噪声底 | 比值 |" if floor else "|"),
+             "|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+             + ("---:|---:|" if floor else "")]
+    # Each grid point stands for the z-interval halfway to its neighbours, so
+    # the weights sum to one over the grid's span.  Not a claim that the grid
+    # is a quadrature rule -- it is here so a reader can see which rows the
+    # held-out average is actually made of.
+    zs = [math.log(sig / sigma_data) for sig in sigmas]
+    zs = [(z - P_MEAN) / P_STD for z in zs]
+    edges = [-math.inf] + [(a + b) / 2 for a, b in zip(zs, zs[1:])] + [math.inf]
+    def phi(z: float) -> float:
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    for i, sig in enumerate(sigmas):
+        ks = [k for k in keys if k[1] == sig]
+        if not ks:
+            continue
+        eff = paired(arms[high], arms[low], ks, metric)
+        w = phi(edges[i + 1]) - phi(edges[i])
+        row = (f"| {sig:.2f} | {zs[i]:+.2f} | {band_of(sig)} | "
+               f"{c_skip_of(sig):.3f} | {w * 100:.1f}% | {eff['n']} | "
+               f"{eff['base']:.4f} | {eff['mean']:+.4f} ({eff['rel']:+.2f}%) | "
+               f"±{eff['se']:.4f} | {eff['t']:.1f} | ")
+        if floor:
+            fl = paired(arms[floor[0]], arms[floor[1]], ks, metric)
+            ratio = (abs(eff["mean"]) / abs(fl["mean"])
+                     if fl["mean"] else float("inf"))
+            row += f"{abs(fl['rel']):.2f}% | {ratio:.2f} |"
+        lines.append(row)
+    return lines
+
+
 def read_item2(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
                names: dict[str, str]) -> list[str]:
     """Section 6 item 2: the oracle gate, both halves."""
@@ -469,6 +523,14 @@ def main() -> int:
             out.append(f"| {role} | `{arm}` | {len(arms[arm])} |")
     out += read_item1(arms, keys, names)
     out += read_item2(arms, keys, names)
+
+    for metric in ("loss_edm_weighted", "mse_aligned"):
+        out.append(f"\n### 多报 · 逐 σ（`{metric}`），三段平均的是这些行\n")
+        out.append("「训练抽样占比」是该网格点代表的 z 区间在训练对数正态下的"
+                   "质量 —— 留出 loss 按它加权，而本表等权，这是同一个 "
+                   "checkpoint 上两者可能不一致的全部原因。\n")
+        out += per_sigma(arms, keys, high=names["random"], low=names["zero"],
+                         floor=(names["zero"], names["floor"]), metric=metric)
 
     out.append("\n### 多报 · 三段 × 三箱 Δt（`loss_edm_weighted`）\n")
     lines, _ = table(arms, keys, high=names["random"], low=names["zero"],
