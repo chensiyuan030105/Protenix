@@ -92,7 +92,51 @@ optim_configs = {
     "adam": {
         "beta1": 0.9,
         "beta2": 0.95,
-        "weight_decay": 1e-8,
+        # P010 D16, 2026-10-08: 0 and not 1e-8, which P009 section 8 item 8
+        # handed to this plan to fix.
+        #
+        # The optimizer is plain Adam (use_adamw below is False), so weight
+        # decay is *coupled* -- added to the gradient and then put through
+        # Adam's normalisation.  `eps` is not passed, so it is torch's default
+        # 1e-8, which is exactly `weight_decay`.  For a parameter whose data
+        # gradient is ~0 the whole gradient is wd*theta, and
+        #
+        #     update = lr * g/(sqrt(g^2) + eps)
+        #            = lr * (1e-8*theta)/(1e-8*theta + 1e-8)
+        #            = lr * theta/(theta + 1)        <- wd cancels out
+        #
+        # which for theta << 1 is exponential decay at rate = lr.  The size of
+        # wd does not matter; it appears in numerator and denominator.
+        #
+        # Measured with these exact hyperparameters (theta0 = 1, grad = 0):
+        #
+        #   wd=1e-8, eps=1e-8   500 steps 0.6037   2000 0.0678   5000 0.000299
+        #   wd=0                          1.000000        1.000000      1.000000
+        #   eps=1e-6                      0.9911          0.9650        0.9147
+        #   use_adamw=True                1.000000        1.000000      1.000000
+        #
+        # The victim class is narrow -- theta != 0 *and* data gradient
+        # <~ 1e-8*theta -- and in this codebase it is one parameter:
+        # wp_layernorm.weight, initialised to 1.  P009 measured the `zero`
+        # arm's gamma decaying at 1.83e-3/step, equal to lr, with a provably
+        # zero data gradient; and `random`'s at 0.33e-3/step, 5.5x slower,
+        # which is how it established that the data gradient *resists* the
+        # artefact rather than causing the decay.
+        #
+        # Why 0 rather than use_adamw=True, which also fixes it: this is the
+        # smaller change.  1e-8 is four to six orders of magnitude below any
+        # real weight decay (1e-2 to 1e-4), so it was never regularising
+        # anything; setting it to 0 removes a force that was only ever an
+        # artefact.  use_adamw=True would additionally switch 442M parameters
+        # to decoupled decay and regroup every 1-D parameter.
+        #
+        # Why this matters past this one parameter, which is P009's point and
+        # the reason it is fixed rather than annotated: the experiment this
+        # project keeps running is "add a gated side branch and see whether the
+        # model uses it".  If the gate starts non-zero and gets a weak
+        # gradient, Adam closes it whatever the data does -- and the gate's
+        # value is exactly the quantity being read.
+        "weight_decay": 0.0,
         "lr": GlobalConfigValue("lr"),
         "use_adamw": False,
     },

@@ -117,6 +117,71 @@ def check_no_empty_args() -> None:
           "an empty value shifts every later --key/value pair by one")
 
 
+def check_optimizer_leaves_idle_params_alone(*, cfg_root: Any) -> None:
+    """A parameter with no data gradient must keep its value.  D16.
+
+    This tests the *property*, not the setting, and that is the whole point:
+    `weight_decay = 0` is today's fix, but `eps`, the optimizer class, or a
+    future `use_adamw` would each change the answer, and a test that asserted
+    "weight_decay is 0" would pass while the artefact came back by another
+    route.
+
+    What it is defending against (P009 section 8 item 8).  With plain Adam,
+    weight decay is coupled -- added to the gradient and then normalised by
+    Adam.  With `wd` and `eps` both 1e-8, a parameter whose data gradient is
+    ~0 gets
+
+        update = lr * (wd*theta)/(wd*theta + eps) = lr * theta/(theta + 1)
+
+    and `wd` cancels out, so for theta << 1 it is exponential decay at rate =
+    lr regardless of how small wd is.  Measured with these hyperparameters:
+    theta goes 1 -> 0.604 -> 0.068 -> 0.000299 over 500 / 2000 / 5000 steps.
+
+    The victim class is narrow -- non-zero initial value *and* a data gradient
+    below ~1e-8*theta -- and in this codebase it is exactly
+    wp_layernorm.weight, initialised to 1.  Which is the gate of the fusion.
+    The experiment this project keeps running is "add a gated side branch and
+    see whether the model uses it", so an optimizer that closes such a gate
+    whatever the data does is aimed squarely at the quantity being read.
+    P009 nearly concluded "the optimizer is refusing the history" from it.
+    """
+    import torch
+
+    adam = cfg_root.adam
+    lr = float(cfg_root.lr)
+    steps = 2000
+    # The real optimizer, built the way protenix builds it, on one scalar
+    # standing in for wp_layernorm.weight: value 1, gradient exactly 0.
+    theta = torch.tensor([1.0], requires_grad=True)
+    Opt = torch.optim.AdamW if adam.use_adamw else torch.optim.Adam
+    opt = Opt([theta], lr=lr, betas=(float(adam.beta1), float(adam.beta2)),
+              weight_decay=float(adam.weight_decay))
+    for _ in range(steps):
+        opt.zero_grad()
+        theta.grad = torch.zeros_like(theta)
+        opt.step()
+    moved = abs(theta.item() - 1.0)
+    check(f"a gamma-like parameter survives {steps} zero-gradient steps",
+          moved < 1e-6,
+          f"it is now {theta.item():.6f} (moved {moved:.2e}); "
+          f"optimizer={Opt.__name__} lr={lr} wd={adam.weight_decay} -- the "
+          f"fusion's gate would be closed by arithmetic rather than by data, "
+          f"and that value is what sections 6.3 reads")
+
+    # And the complement: a parameter *with* a real gradient must still move,
+    # so the fix cannot have been "turn the optimizer off".
+    theta2 = torch.tensor([1.0], requires_grad=True)
+    opt2 = Opt([theta2], lr=lr, betas=(float(adam.beta1), float(adam.beta2)),
+               weight_decay=float(adam.weight_decay))
+    for _ in range(100):
+        opt2.zero_grad()
+        theta2.grad = torch.full_like(theta2, 1e-4)
+        opt2.step()
+    check("while a parameter with a real gradient still moves",
+          abs(theta2.item() - 1.0) > 1e-3,
+          f"it is now {theta2.item():.6f} after 100 steps at grad=1e-4")
+
+
 def check_readout_on_fixture() -> None:
     """Drive kineidos.read_sigma_grid over four tiny arms.
 
@@ -303,6 +368,10 @@ def main() -> int:
         check("and a real arm still passes", True)
     except SystemExit as exc:
         check("and a real arm still passes", False, str(exc)[:80])
+
+    print("\n=== 4b. a zero-gradient parameter is not destroyed by the optimizer ===")
+    check_optimizer_leaves_idle_params_alone(cfg_root=make_configs(
+        "random", tempfile.mkdtemp(prefix="p010_check_adam_")))
 
     print("\n=== 5. no sbatch passes an empty value on the command line ===")
     check_no_empty_args()
