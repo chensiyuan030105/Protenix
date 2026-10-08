@@ -343,6 +343,34 @@ def _load_thresholds_uncached(path: Optional[Path] = None) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def write_env_lock(out_dir: Path) -> None:
+    """One env.lock per run directory, as AGENTS.md requires.
+
+    The directory name does not fix its contents: what is installed, which
+    commit each of the two trees was on, and which environment variables were in
+    force all have to be on disk, or a log months later points at a state that
+    no longer exists.  `meta.<arm>.json` carries the commits too; this is the
+    file the workspace convention names, in the format every other run uses.
+
+    Written per run and not per arm: several arms share one output directory and
+    they run in the same environment.  A second arm overwrites the first's copy
+    with an equivalent one.
+    """
+    from kineidos.env_lock import collect, find_workspace_root
+
+    try:
+        record = collect(find_workspace_root())
+    except SystemExit as exc:
+        print(f"[env.lock] skipped: {exc}")
+        return
+    (out_dir / "env.lock").write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n")
+    for label, tree in record.get("worktrees", {}).items():
+        flag = " [DIRTY]" if tree.get("dirty") else ""
+        print(f"[env.lock] {label:12s} {str(tree.get('commit'))[:12]} "
+              f"({tree.get('branch')}){flag}")
+
+
 def worktree_commits() -> dict[str, Any]:
     from kineidos.env_lock import collect, find_workspace_root
 
@@ -368,6 +396,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    write_env_lock(out_dir)
     root = Path(args.gagu_root)
 
     print(f"[setup] window set: {args.n_windows} windows, seed {EVAL_SEED}, "

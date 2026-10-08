@@ -67,7 +67,8 @@ import numpy as np
 
 from kineidos.bench import metrics as M
 from kineidos.bench.oneshot import (GAGU_ROOT, held_out_samples, load_thresholds,
-                                    system_key, topologies_for, worktree_commits)
+                                    system_key, topologies_for, worktree_commits,
+                                    write_env_lock)
 
 K = 8
 STRIDE = 1
@@ -447,6 +448,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    write_env_lock(out_dir)
     root = Path(args.gagu_root)
 
     from kineidos.data.gagu import GAGUProtenixAdapter
