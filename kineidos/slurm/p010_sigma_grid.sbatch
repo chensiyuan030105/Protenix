@@ -137,11 +137,27 @@ for entry in ${ARMS}; do
   # partial file behind, and "the file is there" would skip it and leave a
   # truncated arm in the readout looking like a complete one.  The marker is
   # written only after python exits 0.
+  # The marker carries the commit that wrote it, not just the fact that
+  # something did.  Same reason as the resume gate: an arm scored before a
+  # change to score_sigma_grid and skipped after it would put rows from two
+  # code versions in one table, with every gate green -- the file is complete,
+  # the row count is right, the windows pair.  The P006 session's input
+  # fingerprint gate, applied here.
+  TREE_SHA=$(git -C "${TREE}" rev-parse HEAD 2>/dev/null || echo unknown)
+  TREE_DIRTY=$([ -n "$(git -C "${TREE}" status --porcelain 2>/dev/null)" ] && echo dirty || echo clean)
+  FP="${TREE_SHA} ${TREE_DIRTY}"
   DONE="${OUT}/.done_${ARM}${SUFFIX}_step${STEP}"
   if [ -f "${DONE}" ] && [ "${FORCE:-0}" != "1" ]; then
+    WAS=$(cat "${DONE}" 2>/dev/null || echo "")
+    if [ "${WAS}" = "${FP}" ] && [ "${TREE_DIRTY}" = "clean" ]; then
+      echo ""
+      echo "=== ${ARM}: already done at ${TREE_SHA:0:12}; FORCE=1 to rescore ==="
+      continue
+    fi
     echo ""
-    echo "=== ${ARM}: already done (${DONE}); FORCE=1 to rescore ==="
-    continue
+    echo "=== ${ARM}: rescoring -- the marker says '${WAS}' and this tree is"
+    echo "    '${FP}'. A dirty tree never counts as done, because the commit"
+    echo "    does not identify the code. ==="
   fi
   echo ""
   echo "=== ${ARM} (wp.mode=${MODE}) <- ${TARGET} ==="
@@ -172,8 +188,8 @@ for entry in ${ARMS}; do
       --kineidos.sigma_grid_noise "${SIGMA_NOISE}" \
       --kineidos.sigma_grid_out "${OUT}" \
       "$@"; then
-    : > "${DONE}"
-    echo "=== ${ARM}: ok ==="
+    printf '%s\n' "${FP}" > "${DONE}"
+    echo "=== ${ARM}: ok (${TREE_SHA:0:12} ${TREE_DIRTY}) ==="
   else
     # One arm failing must not throw away the arms that already scored: the
     # files are written per arm and the comparison can be made with what came

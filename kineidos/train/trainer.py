@@ -263,7 +263,47 @@ class KineidosTrainer(AF3Trainer):
         # 3 GB file to add one string is not worth it, and a sidecar can be read
         # without torch.load.
         (link.parent / "latest.arm").write_text(self.configs.wp.mode + "\n")
+        self.write_resume_provenance(link.parent)
         self.print(f"latest.pt -> {saved}")
+
+    def write_resume_provenance(self, where: Path) -> None:
+        """Which code wrote this checkpoint, beside the checkpoint.
+
+        The input-fingerprint gate the P006 session arrived at from four
+        separate silent-corruption incidents, applied to the one place P010
+        reuses an upstream artefact: `latest.pt`.
+        
+        The shape of the hazard here.  The diagnostic arms are 2000 steps on
+        `background`, which preempts with no grace period, and resume() reloads
+        latest.pt.  Development happens in the same worktree -- 22 commits to
+        this tree in one session.  So an arm can be preempted, the tree can
+        move, and the requeued arm resumes an optimizer state written by code
+        that no longer exists, while its env.lock records the *new* commit.
+        Every existing gate is green: latest.arm matches, the state_dict loads
+        with nothing missing, the loss curve continues smoothly.  Nothing says
+        the run is now two code versions stitched together.
+        """
+        import json
+
+        from kineidos.env_lock import code_trees, find_workspace_root
+
+        try:
+            trees = code_trees(find_workspace_root())
+        except Exception as exc:                            # noqa: BLE001
+            # Never let provenance bookkeeping lose a checkpoint.  A missing
+            # sidecar makes the gate say "cannot verify", which is the right
+            # answer and is not silence.
+            self.print(f"[resume] could not record provenance: {exc}")
+            return
+        record = {
+            "wp_mode": self.configs.wp.mode,
+            "step": self.step,
+            "trees": {name: {"commit": t.get("commit"), "tags": t.get("tags"),
+                             "dirty": t.get("dirty")}
+                      for name, t in trees.items()},
+        }
+        (where / "latest.provenance").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n")
 
     def resume(self, path: Path) -> bool:
         """Continue a run that was interrupted.  True if it actually resumed.
@@ -284,6 +324,7 @@ class KineidosTrainer(AF3Trainer):
                     f"every shared key and leave the bridge at initialisation, "
                     f"giving a run that is neither arm. Use a resume_dir per arm."
                 )
+        self.check_resume_provenance(path.parent)
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         state = checkpoint["model"]
         if next(iter(state)).startswith("module."):
@@ -300,6 +341,90 @@ class KineidosTrainer(AF3Trainer):
         self.global_step = self.step * self.iters_to_accumulate
         self.print(f"Resumed {self.configs.wp.mode!r} from {path} at step {self.step}")
         return True
+
+    def check_resume_provenance(self, where: Path) -> None:
+        """Refuse to resume a checkpoint that different code wrote.
+
+        Not a warning.  A warning in a slurm log that nobody reads until the
+        run is over is the same as no check: the arm would finish, look
+        normal, and be two code versions stitched at whatever step the
+        preemption happened.  There is no way to tell afterwards which half of
+        the curve came from which.
+
+        `kineidos.allow_resume_across_code` is the escape hatch, and it is a
+        config key rather than an environment variable so that using it is
+        recorded in the run's own env.lock.
+
+        A dirty tree on either side also refuses: "same commit" says nothing
+        when there are uncommitted edits, which is the normal state of a tree
+        somebody is working in.
+        """
+        import json
+
+        from kineidos.env_lock import code_trees, find_workspace_root
+
+        sidecar = where / "latest.provenance"
+        if not sidecar.is_file():
+            # Written by a run from before this check existed.  Say so rather
+            # than passing silently -- "cannot verify" is a different state
+            # from "verified".
+            self.print(
+                f"[resume] {sidecar} is absent, so which code wrote this "
+                f"checkpoint cannot be verified. Written before this check "
+                f"existed, or removed."
+            )
+            return
+        try:
+            was = json.loads(sidecar.read_text())
+            now_trees = code_trees(find_workspace_root())
+        except Exception as exc:                            # noqa: BLE001
+            self.print(f"[resume] could not check provenance: {exc}")
+            return
+
+        problems: list[str] = []
+        for name, then in (was.get("trees") or {}).items():
+            now = now_trees.get(name)
+            if now is None:
+                problems.append(f"{name}: was on PYTHONPATH, now is not")
+                continue
+            if then.get("commit") != now.get("commit"):
+                problems.append(
+                    f"{name}: checkpoint written at "
+                    f"{str(then.get('commit'))[:12]}"
+                    f"{' @' + ','.join(then.get('tags') or []) if then.get('tags') else ''}"
+                    f", now {str(now.get('commit'))[:12]}"
+                    f"{' @' + ','.join(now.get('tags') or []) if now.get('tags') else ''}")
+            if then.get("dirty") or now.get("dirty"):
+                problems.append(
+                    f"{name}: dirty tree ({'then' if then.get('dirty') else ''}"
+                    f"{' and ' if then.get('dirty') and now.get('dirty') else ''}"
+                    f"{'now' if now.get('dirty') else ''}), so the commit does "
+                    f"not identify the code")
+        if not problems:
+            self.print("[resume] provenance checks out: same code wrote this "
+                       "checkpoint")
+            return
+        if self.configs.kineidos.allow_resume_across_code:
+            self.print("[resume] CODE CHANGED UNDER THIS RUN, and "
+                       "kineidos.allow_resume_across_code says to continue:")
+            for p_ in problems:
+                self.print(f"  {p_}")
+            self.print("  this arm is two code versions stitched at the step "
+                       "the preemption happened; nothing downstream can tell "
+                       "which half is which")
+            return
+        raise ValueError(
+            "refusing to resume: the code changed since this checkpoint was "
+            "written.\n  " + "\n  ".join(problems) + "\n"
+            "The arms are 2000 steps on a preemptible partition and "
+            "development happens in the same worktree, so this is the normal "
+            "way a run becomes two code versions stitched together -- with "
+            "every other gate green: latest.arm matches, the state_dict loads "
+            "with nothing missing, the loss curve continues smoothly. Start "
+            "the arm again on one commit, or set "
+            "--kineidos.allow_resume_across_code true to say in the run's own "
+            "env.lock that you meant it."
+        )
 
     def try_load_checkpoint(self) -> None:
         """Resume if there is a run to resume, otherwise load the pretrained trunk.

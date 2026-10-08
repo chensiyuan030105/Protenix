@@ -69,6 +69,17 @@ def _run(cmd: list[str], cwd: str | None = None) -> str | None:
     return out.stdout.strip() if out.returncode == 0 else None
 
 
+def code_trees(workspace: Path) -> dict[str, object]:
+    """The public name for _code_trees, for callers outside this module.
+
+    kineidos/train/trainer.py's resume gate needs the commits and tags of the
+    trees this process imports from, and needs them cheaply -- collect() also
+    runs pip freeze, which is seconds and writes a whole lock.  Same function,
+    so the gate and the lock cannot disagree about which tree is running.
+    """
+    return _code_trees(workspace)
+
+
 def _code_trees(workspace: Path) -> dict[str, object]:
     """The code trees this process imports from, derived rather than named.
 

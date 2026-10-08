@@ -564,6 +564,11 @@ kineidos_configs = {
         # The trained checkpoint kineidos.score_sigma_grid scores.  Only that
         # entry point reads it; a training run leaves it empty.
         "score_checkpoint": "",
+        # Resume across a code change.  False refuses, which is the default:
+        # see KineidosTrainer.check_resume_provenance.  A config key rather
+        # than an environment variable, so that using it is recorded in the
+        # run's own env.lock instead of only in a shell history.
+        "allow_resume_across_code": False,
     },
 }
 
