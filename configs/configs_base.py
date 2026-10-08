@@ -521,6 +521,30 @@ kineidos_configs = {
         # `random` model would load every shared key and leave the bridge at
         # initialisation, giving a run that is neither arm.
         "resume_dir": "",
+        # Kineidos (P010 D1): the per-sigma held-out reading.  All five default
+        # to off or empty, so a run that does not ask for them behaves exactly
+        # as it did under P009 -- the protocol is the defaults (P010 D11).
+        #
+        # `sigma_grid` makes every evaluation round write the per-sigma file
+        # beside the per-window one.  It is not on by default because it costs
+        # a second pass over the held-out set, and P009's four arms must keep
+        # scoring what they have been scoring.
+        "sigma_grid": False,
+        # Noise samples per sigma per window.  Four is what section 4 sizes;
+        # with eleven sigmas that is a 44-sample diffusion batch, close enough
+        # to the 48 of training that memory behaves the same.
+        "sigma_grid_noise": 4,
+        # The name written into every row's `arm` field, and into the file
+        # name.  Empty means "derive it", which is right inside a training run
+        # and wrong when scoring someone else's checkpoint.
+        "sigma_grid_arm": "",
+        # Where the jsonl goes.  Empty means run_dir/sigma_grid; the standalone
+        # scorer points it at runs/p010/sigma_grid so that several arms' files
+        # land together.
+        "sigma_grid_out": "",
+        # The trained checkpoint kineidos.score_sigma_grid scores.  Only that
+        # entry point reads it; a training run leaves it empty.
+        "score_checkpoint": "",
     },
 }
 

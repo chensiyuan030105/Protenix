@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# P010 D1 / D7: the per-sigma held-out reading, off a checkpoint, on a GPU.
+#
+# One job for several arms, run one after another in the same allocation.  Four
+# arms at ~20 minutes each fit in one queue slot, and right now a queue slot is
+# the scarce thing: every A100 on the cluster is allocated (2026-10-08 ~10:00),
+# so four separate one-GPU jobs would wait four times rather than once.
+#
+# Each arm is a separate python process, because `none` builds a different
+# architecture from the other three and the config that decides that is read in
+# a constructor.
+#
+#   # D7: the four P009 arms at their step-3000 checkpoint (the file is 2999.pt)
+#   sbatch --gres=gpu:a100:1 --cpus-per-task=8 --mem=96G --nodes=1 \
+#          --exclude=<busy nodes> \
+#          --export=ALL,STEP=2999,ARMS='p009_random:random p009_zero:zero p009_zero_seed2:zero p009_none:none' \
+#          repos/research/kineidos-v3-diag/kineidos/slurm/p010_sigma_grid.sbatch
+#
+#   # Section 4's acceptance: none == zero at step 0, and a repeat run of one
+#   # arm is bit-identical to the first.
+#   --export=ALL,STEP=0,ARMS='step0_none:none step0_zero:zero',CKPT=pretrained
+#   --export=ALL,STEP=2999,ARMS='p009_zero:zero',SUFFIX=_repeat
+#SBATCH --job-name=p010-sigma
+#SBATCH --partition=background
+#SBATCH --account=grad-students
+#SBATCH --requeue
+#SBATCH --open-mode=append
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=06:00:00
+#SBATCH --output=/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace/runs/slurm/%x-%j.out
+#SBATCH --error=/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace/runs/slurm/%x-%j.err
+
+set -euo pipefail
+
+WORKSPACE="/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace"
+TREE="${TREE:-repos/research/kineidos-v3-diag}"
+ENV="/mnt/xfs/home/mhg/anaconda3/envs/kineidos-v2-slurm"
+PRETRAINED="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/runtimes/checkpoints/protenix_pretrained/protenix_base_default_v1.0.0.pt"
+
+# "<arm name>:<wp.mode>" per entry.  The arm name is both the row label and the
+# run directory prefix the checkpoint is found under, so it is not cosmetic.
+ARMS="${ARMS:?set ARMS to a space separated list of <arm>:<wp.mode>}"
+STEP="${STEP:?set STEP to the checkpoint step, e.g. 2999, or 0 with CKPT=pretrained}"
+RUNS="${RUNS:-${WORKSPACE}/runs/p009}"
+OUT="${OUT:-${WORKSPACE}/runs/p010/sigma_grid}"
+SUFFIX="${SUFFIX:-}"
+EVAL_WINDOWS="${EVAL_WINDOWS:-256}"
+SIGMA_NOISE="${SIGMA_NOISE:-4}"
+
+GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/processed/gagu_internal_loop_v0_1"
+# r4 is held out, r1-r3 train -- the same split p004_train.sbatch makes, and it
+# has to be the same split or the windows are not the ones the arms were scored
+# on.  train_samples is named too, because init_data refuses an empty list;
+# nothing here trains, so one trajectory is enough to satisfy it.
+HELD_OUT="${HELD_OUT:-$(ls -d ${GAGU_ROOT}/*_r4 2>/dev/null | xargs -n1 basename | paste -sd,)}"
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-gagu_100mM_K_agaguu_startI_r1}"
+
+mkdir -p "${WORKSPACE}/runs/slurm" "${OUT}" "${WORKSPACE}/runs/p010/scratch"
+cd "${WORKSPACE}"
+
+export PYTHONPATH="${TREE}:repos/research/wp-v2"
+export PYTHONUNBUFFERED=1
+export LD_LIBRARY_PATH="${ENV}/lib:${LD_LIBRARY_PATH:-}"
+export ATTN_IMPL="${ATTN_IMPL:-sdpa}"
+export LAYERNORM_TYPE="${LAYERNORM_TYPE:-torch}"
+export TRIANGLE_ATTENTION="${TRIANGLE_ATTENTION:-cuequivariance}"
+export TRIANGLE_MULTIPLICATIVE="${TRIANGLE_MULTIPLICATIVE:-cuequivariance}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+
+echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
+echo "TREE=${TREE} STEP=${STEP} OUT=${OUT} ARMS=${ARMS}"
+echo "HELD_OUT: $(echo "${HELD_OUT}" | tr ',' '\n' | grep -c .) trajectories (r4)"
+NGPU_WANT=1
+# shellcheck source=./p010_preflight.sh
+source "${TREE}/kineidos/slurm/p010_preflight.sh"
+
+newest_run () {
+  # The newest run directory for one arm prefix.  Anchored on the timestamp
+  # init_basics appends, for read_heldout.py's reason: a plain prefix match
+  # makes p009_zero swallow p009_zero_seed2, which would score the noise-floor
+  # arm under the baseline's name.
+  ls -d "${RUNS}"/"$1"_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9] \
+    2>/dev/null | sort | tail -1
+}
+
+FAILED=""
+for entry in ${ARMS}; do
+  ARM="${entry%%:*}"
+  MODE="${entry##*:}"
+  if [ "${CKPT:-}" = "pretrained" ]; then
+    TARGET="pretrained"
+  else
+    RUN_DIR="$(newest_run "${ARM}")"
+    [ -n "${RUN_DIR}" ] || { echo "no run directory for ${ARM} under ${RUNS}" >&2; exit 1; }
+    TARGET="${RUN_DIR}/checkpoints/${STEP}.pt"
+    [ -f "${TARGET}" ] || { echo "no checkpoint ${TARGET}" >&2; exit 1; }
+  fi
+  echo ""
+  echo "=== ${ARM} (wp.mode=${MODE}) <- ${TARGET} ==="
+  # A scratch base_dir per arm: the trainer creates a run directory and writes
+  # an env.lock into it, which is exactly what AGENTS.md asks of a run, and it
+  # records wp.mode, both commits and the two hand-placed libraries' sha256.
+  if "${ENV}/bin/python" -u -m kineidos.score_sigma_grid \
+      --model_name protenix_base_default_v1.0.0 \
+      --wp.mode "${MODE}" \
+      --load_checkpoint_path "${PRETRAINED}" \
+      --project p010 \
+      --run_name "sigma_grid_${ARM}${SUFFIX}" \
+      --base_dir "${WORKSPACE}/runs/p010/scratch" \
+      --max_steps 1 \
+      --eval_interval -1 \
+      --checkpoint_interval -1 \
+      --use_wandb false \
+      --skip_confidence true \
+      --skip_distogram true \
+      --loss.weight.alpha_confidence 0.0 \
+      --loss.weight.alpha_distogram 0.0 \
+      --kineidos.train_samples "${TRAIN_SAMPLES}" \
+      --kineidos.num_workers 0 \
+      --kineidos.held_out_samples "${HELD_OUT}" \
+      --kineidos.eval_windows "${EVAL_WINDOWS}" \
+      --kineidos.score_checkpoint "${TARGET}" \
+      --kineidos.sigma_grid_arm "${ARM}${SUFFIX}" \
+      --kineidos.sigma_grid_noise "${SIGMA_NOISE}" \
+      --kineidos.sigma_grid_out "${OUT}" \
+      "$@"; then
+    echo "=== ${ARM}: ok ==="
+  else
+    # One arm failing must not throw away the arms that already scored: the
+    # files are written per arm and the comparison can be made with what came
+    # back.  The exit code still reports it.
+    echo "=== ${ARM}: FAILED ===" >&2
+    FAILED="${FAILED} ${ARM}"
+  fi
+done
+
+if [ -n "${FAILED}" ]; then
+  echo "failed arms:${FAILED}" >&2
+  exit 1
+fi
+echo ""
+echo "all arms scored -> ${OUT}"
+ls -la "${OUT}"

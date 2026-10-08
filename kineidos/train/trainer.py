@@ -489,6 +489,23 @@ class KineidosTrainer(AF3Trainer):
         self.print(f"[eval] step {self.step} over {n} held-out windows "
                    f"(N_cycle={self.configs.model.N_cycle}): {headline}")
 
+        # The per-sigma reading, on the same windows in the same round (P010
+        # D1).  Off by default, and after the per-window rows are already on
+        # disk: this is the new and less proven of the two, and a failure in it
+        # must not cost the round's held-out numbers.
+        if self.configs.kineidos.sigma_grid:
+            from kineidos import score_sigma_grid
+
+            out = self.configs.kineidos.sigma_grid_out
+            score_sigma_grid.score(
+                self,
+                step=self.step,
+                arm=self.configs.kineidos.sigma_grid_arm
+                or self.configs.run_name,
+                out_dir=Path(out) if out else Path(self.run_dir) / "sigma_grid",
+                n_noise=int(self.configs.kineidos.sigma_grid_noise),
+            )
+
         if was_training:
             self.raw_model.train()
 
