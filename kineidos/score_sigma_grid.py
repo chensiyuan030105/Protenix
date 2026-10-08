@@ -385,7 +385,14 @@ def arm_matches_state(state: dict[str, Any], mode: str) -> None:
     never ran.
     """
     has_fusion = any("wp_fusion" in k for k in state)
-    has_bridge = any(k.startswith("wp_bridge.") for k in state)
+    # `wp_bridge.wp.`, not `wp_bridge.`: what distinguishes the arms is whether
+    # WorldParticle's own network is there, and a bridge can carry other
+    # tensors without running it -- P010's oracle arm holds a fixed projection
+    # buffer at wp_bridge.oracle_projection, so the looser prefix would read it
+    # as a `random` arm.  This file is merged back into v3 (D11), which is why
+    # the test is about the network rather than about a mode this branch has
+    # never heard of.
+    has_bridge = any(k.startswith("wp_bridge.wp.") for k in state)
     want_fusion = mode != "none"
     want_bridge = mode in ("random", "pretrained")
     if has_fusion != want_fusion or has_bridge != want_bridge:
