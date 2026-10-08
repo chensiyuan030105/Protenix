@@ -122,8 +122,8 @@ EVAL_WINDOWS="${EVAL_WINDOWS:-256}"
 # two questions, and the one to settle first.  Holding out a whole sequence
 # instead asks about chemistry generalisation and is a separate set of runs.
 GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/processed/gagu_internal_loop_v0_1"
-TRAIN_SAMPLES="${TRAIN_SAMPLES:-$(ls -d ${GAGU_ROOT}/*_r[123] 2>/dev/null | xargs -n1 basename | paste -sd,)}"
-HELD_OUT="${HELD_OUT:-$(ls -d ${GAGU_ROOT}/*_r4 2>/dev/null | xargs -n1 basename | paste -sd,)}"
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-$({ ls -d ${GAGU_ROOT}/*_r[123] 2>/dev/null || true; } | xargs -r -n1 basename | paste -sd,)}"
+HELD_OUT="${HELD_OUT:-$({ ls -d ${GAGU_ROOT}/*_r4 2>/dev/null || true; } | xargs -r -n1 basename | paste -sd,)}"
 N_TRAIN=$(echo "${TRAIN_SAMPLES}" | tr ',' '\n' | grep -c .)
 N_HELD=$(echo "${HELD_OUT}" | tr ',' '\n' | grep -c .)
 

@@ -75,8 +75,23 @@ GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/data
 # has to be the same split or the windows are not the ones the arms were scored
 # on.  train_samples is named too, because init_data refuses an empty list;
 # nothing here trains, so one trajectory is enough to satisfy it.
-HELD_OUT="${HELD_OUT:-$(ls -d ${GAGU_ROOT}/*_r4 2>/dev/null | xargs -n1 basename | paste -sd,)}"
+HELD_OUT="${HELD_OUT:-$({ ls -d ${GAGU_ROOT}/*_r4 2>/dev/null || true; } | xargs -r -n1 basename | paste -sd,)}"
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-gagu_100mM_K_agaguu_startI_r1}"
+# Refuse an empty list rather than passing one on the command line.  The
+# defaults above are `ls | xargs | paste` pipelines, so a renamed or missing
+# GAGU_ROOT makes them the empty string -- the same failure that cost job
+# 2149587 (an empty value does not merely vanish: parse_sys_args builds
+# `f"{k} {v} "` and parse_configs splits it, so the key is left bare and every
+# later --key/value pair shifts by one), but reached from a missing dataset
+# rather than from a hardcoded "".  check_p010's static scan cannot see this
+# one, because there is no "" written anywhere.
+#
+# `:?` because it fires on empty *and* unset, at the point the value is used,
+# without anyone having to remember to scan for it (the idiom is the P006
+# session's).  Printing the count below is not enough: it reports and
+# continues.
+: "${TRAIN_SAMPLES:?no training trajectories matched under ${GAGU_ROOT} -- check the path, do not pass an empty list}"
+: "${HELD_OUT:?no held-out trajectories matched under ${GAGU_ROOT} -- without them evaluate() scores nothing and the arm would train for its whole length and produce no rows}"
 
 mkdir -p "${WORKSPACE}/runs/slurm" "${OUT}" "${WORKSPACE}/runs/p010/scratch"
 cd "${WORKSPACE}"
