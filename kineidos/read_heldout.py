@@ -266,14 +266,26 @@ def main() -> int:
             f"±{se_floor:.4f} | {ratio:.2f} | {verdict} |")
     lines.append("")
     # Said once, in the report, because a ratio of two unresolved estimates is
-    # the way this read goes wrong.
-    unresolved = [v[0] for v in verdicts if v[8] < 2.0]
-    if unresolved:
+    # the way this read goes wrong -- and it goes wrong from either side.  At
+    # step 2499 bin 3's floor came out 0.0010 +/- 0.0066, |t| = 0.1, and the
+    # ratio was 12.63; the registered rule read that as "above the floor" while
+    # the denominator was indistinguishable from zero.  Checking only the
+    # effect's |t|, as this did at first, is silent on exactly that case.
+    weak_effect = [v[0] for v in verdicts if v[8] < 2.0]
+    weak_floor = [v[0] for v in verdicts
+                  if v[9] > 0 and abs(v[4] / v[9]) < 2.0]
+    if weak_effect:
         lines += [
-            f"> **{', '.join(unresolved)} 的效应没有从零分辨出来**（|t| < 2）。"
-            f"§6.2 的「比值」是两个点估计相除，而两边各有自己的误差棒；"
-            f"底偶然偏小就会把一个不显著的效应读成超了底。"
-            f"判据按登记的规则给出，不改；这一行是多报的诊断。", ""]
+            f"> **{', '.join(weak_effect)} 的效应没有从零分辨出来**（|t| < 2）。", ""]
+    if weak_floor:
+        lines += [
+            f"> **{', '.join(weak_floor)} 的噪声底没有从零分辨出来**（|t| < 2），"
+            f"所以这些箱的「比值」是在除一个与零无法区分的数，不可解读——"
+            f"底偶然抽小就会把任何效应放大成一个大比值。", ""]
+    if weak_effect or weak_floor:
+        lines += [
+            "> §6.2 的「比值」是两个点估计相除，而两边各有自己的误差棒。"
+            "判据按登记的规则给出，不改；以上是多报的诊断。", ""]
 
     if "none" in data:
         lines += ["## `none`（不进主结论，只复核 `zero` 的额外 Linear 是中性的）", "",
@@ -290,7 +302,16 @@ def main() -> int:
     name, above, lower, effect, floor, ratio, z, se_effect, t_effect, se_floor = \
         verdicts[0]
     lines += ["## 判定", ""]
-    if above and lower:
+    floor_resolved = se_floor > 0 and abs(floor / se_floor) >= 2.0
+    if above and lower and not floor_resolved:
+        lines += [
+            f"按 §6.2 的规则，箱 1 的差超过噪声底（{ratio:.2f} 倍）且方向正确，"
+            f"**但那个底是 {floor:.4f} ± {se_floor:.4f}，|t| = "
+            f"{abs(floor / se_floor) if se_floor else float('nan'):.1f}，"
+            f"与零无法区分**。比值因此不可解读：这不是「效应超过了底」，"
+            f"而是「底这一次抽小了」。需要的是把底测准——每档多个种子，"
+            f"并把数据种子与初始化种子分开（§8 第 9 条）——而不是据此宣布结论。"]
+    elif above and lower:
         decay = [v for v in verdicts[1:]]
         # Whether the bin-to-bin change is resolved, not just its sign: at step
         # 499 the effect looked like it grew with dt (+0.42% / +0.82% / +1.02%)
