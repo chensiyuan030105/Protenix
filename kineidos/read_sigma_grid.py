@@ -277,31 +277,89 @@ def read_item2(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
     return out
 
 
+# `arm` is the file's own label -- the tree it came from, or the checkpoint's
+# run directory -- so it differs by construction in exactly the comparisons
+# that matter.  Section 4's acceptance compares `step0_none` against
+# `step0_zero`, and section 6 item 5b compares `identity_...-diag` against
+# `identity_...-diag-oracle`.  Byte comparison would report both as different
+# on that field alone and say nothing about the numbers.
+IDENTITY_IGNORE = ("arm",)
+
+
+def flatten(row: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Every leaf of a row, so nothing is compared by accident or skipped."""
+    out: dict[str, Any] = {}
+    for key, value in row.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            out.update(flatten(value, f"{name}."))
+        else:
+            out[name] = value
+    return out
+
+
 def identical(a: Path, b: Path) -> int:
-    """Byte-for-byte, and if not, which key moved and by how much."""
+    """Are these two scorings the same measurement, field by field.
+
+    Exact equality on every leaf of every row, joined on (window_id, sigma,
+    noise_idx) -- not a tolerance.  Section 4 and section 6 item 5b both ask
+    for "逐位一致", and a tolerance here would hide the one failure these
+    checks exist for: a change that moves the RNG stream by a single draw
+    leaves every number plausible and every arm unpaired.
+
+    Byte identity is reported as well, because it is the stronger statement and
+    it is what the repeat-determinism check should see -- but it is not the
+    verdict, since `arm` differs by construction in the cross-arm comparisons.
+    """
     ta, tb = a.read_bytes(), b.read_bytes()
-    if ta == tb:
-        print(f"  [PASS] {a.name} and {b.name} are byte-identical "
-              f"({len(ta)} bytes)")
-        return 0
-    print(f"  [FAIL] {a.name} and {b.name} differ "
-          f"({len(ta)} vs {len(tb)} bytes)")
+    byte_same = ta == tb
+    print(f"  bytes: {'identical' if byte_same else f'{len(ta)} vs {len(tb)}'}")
+
     ra, rb = load(a), load(b)
-    only = (set(ra) ^ set(rb))
+    only = set(ra) ^ set(rb)
     if only:
-        print(f"    {len(only)} keys in one file only, e.g. {sorted(only)[:3]}")
+        print(f"  [FAIL] {len(only)} (window, sigma, noise) keys are in one "
+              f"file only, e.g. {sorted(only)[:3]}")
+        return 1
+
     worst: dict[str, tuple[float, tuple]] = {}
-    for k in sorted(set(ra) & set(rb)):
-        for m in METRICS:
-            d = abs(ra[k][m] - rb[k][m])
-            if d > worst.get(m, (0.0, None))[0]:
-                worst[m] = (d, k)
-    for m, (d, k) in sorted(worst.items()):
-        print(f"    max |delta| {m:18s} = {d:.3e}  at {k}")
+    unequal: dict[str, tuple[Any, Any, tuple]] = {}
+    for k in sorted(ra):
+        fa, fb = flatten(ra[k]), flatten(rb[k])
+        if set(fa) != set(fb):
+            print(f"  [FAIL] {k} has different fields: "
+                  f"{sorted(set(fa) ^ set(fb))}")
+            return 1
+        for field, va in fa.items():
+            if field in IDENTITY_IGNORE:
+                continue
+            vb = fb[field]
+            if va == vb:
+                continue
+            unequal.setdefault(field, (va, vb, k))
+            if isinstance(va, (int, float)) and isinstance(vb, (int, float)):
+                d = abs(va - vb)
+                if d > worst.get(field, (0.0, None))[0]:
+                    worst[field] = (d, k)
+
+    if not unequal:
+        print(f"  [PASS] {a.name} and {b.name} agree exactly on every field of "
+              f"every one of {len(ra)} rows"
+              + ("" if byte_same else f" (ignoring {list(IDENTITY_IGNORE)})"))
+        return 0
+
+    print(f"  [FAIL] {len(unequal)} fields differ over {len(ra)} rows")
+    for field, (va, vb, k) in sorted(unequal.items()):
+        if field in worst:
+            d, kk = worst[field]
+            print(f"    {field:24s} max |delta| = {d:.3e}  at {kk}")
+        else:
+            print(f"    {field:24s} {va!r} vs {vb!r}  at {k}")
     print("    a nonzero delta here is either the tool being "
-          "nondeterministic or the fusion point having moved; the per-key "
-          "magnitudes above say which (a handful of 1e-7 is arithmetic, a "
-          "uniform offset is not).")
+          "nondeterministic or the code path having moved; the magnitudes say "
+          "which -- a handful of 1e-7 scattered over rows is arithmetic, an "
+          "offset on every row is not, and a difference in a non-numeric "
+          "field means the two runs did not score the same windows.")
     return 1
 
 
