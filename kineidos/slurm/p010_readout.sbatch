@@ -59,6 +59,21 @@ if [ "${MODE}" = "identical" ]; then
     --identical "${A:?set A to the first jsonl}" "${B:?set B to the second}"
 fi
 
+# The config-and-arithmetic acceptance, which is cheap but is still a job: the
+# rule has no size qualifier, and "it is only a parse" is how things end up on
+# the login node.  TREES lets one job check all three branches, since each adds
+# its own layer to the bottom of check_p010.
+if [ "${MODE}" = "check" ]; then
+  RC=0
+  for T in ${TREES:-${TREE}}; do
+    echo ""
+    echo "=== $(basename "${T}") ==="
+    PYTHONPATH="${T}:repos/research/wp-v2" \
+      "${ENV}/bin/python" -u -m kineidos.check_p010 || RC=1
+  done
+  exit "${RC}"
+fi
+
 # shellcheck disable=SC2086
 exec "${ENV}/bin/python" -u -m kineidos.read_sigma_grid \
   --runs "${RUNS}" \
