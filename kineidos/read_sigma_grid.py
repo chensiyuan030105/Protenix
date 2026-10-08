@@ -71,6 +71,21 @@ DT_BINS = (("bin1", 1, 2), ("bin2", 3, 5), ("bin3", 6, 10))
 METRICS = ("mse_aligned", "smooth_lddt", "loss_unweighted", "loss_edm_weighted")
 
 
+class ArmMissing(Exception):
+    """This arm has not been scored yet.
+
+    Distinct from every other failure, and that distinction is the whole
+    reason the class exists.  "Not scored yet" is normal -- the oracle arms do
+    not exist until the oracle branch has run -- and should be skipped with a
+    note.  "Scored and the file is truncated" is not normal and must stop the
+    readout, because a truncated arm that gets skipped leaves a table quietly
+    missing a column, which reads exactly like a table that never had one.
+    Both used to raise SystemExit, and main() caught SystemExit to do the
+    skip, so a preempted arm vanished silently (caught by check_p010's
+    fixture).
+    """
+
+
 def key_of(row: dict[str, Any]) -> tuple[int, float, int]:
     """What makes two rows the same measurement in two arms.
 
@@ -118,7 +133,7 @@ def load_arm(base: Path, arm: str, step: int) -> dict[tuple, dict[str, Any]]:
     """
     paths = sorted(base.glob(f"{arm}_step{step}.rank*.jsonl"))
     if not paths:
-        raise SystemExit(f"no {arm}_step{step}.rank*.jsonl under {base}")
+        raise ArmMissing(f"no {arm}_step{step}.rank*.jsonl under {base}")
     merged: dict[tuple, dict[str, Any]] = {}
     for path in paths:
         for k, row in load(path).items():
@@ -506,7 +521,9 @@ def main() -> int:
             continue
         try:
             arms[arm] = load_arm(base, arm, args.step)
-        except SystemExit as exc:
+        except ArmMissing as exc:
+            # Only "not scored yet" is skippable.  A truncated file raises
+            # SystemExit from load_arm and is left to propagate.
             print(f"  [skip] {role} = {arm}: {exc}")
             continue
         print(f"  {role:8s} {arm:22s} {len(arms[arm])} rows")
