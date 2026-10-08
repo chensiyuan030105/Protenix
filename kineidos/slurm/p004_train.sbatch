@@ -62,7 +62,14 @@
 # 追加而非覆盖。requeue 复用作业 ID，默认的覆盖模式会抹掉重排前的全部日志——
 # 包括抢占本身的证据，于是连"为什么重启了"都查不到。
 #SBATCH --open-mode=append
-#SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-8,deep-gpu-10,deep-gpu-11
+# deep-chungus-7 添加于 2026-10-08：它的 GPU 7 上 CUDA runtime 起不来，而 nvidia-smi
+# 把那张卡报成健康、显存全空，所以「可见性」与「显存没被占」两类检查都通过。P006 实测
+# 一个 54 任务的 array 里 35 个被拒，全部落在这一张卡；而它正因为作业在上面失败或慢到
+# 异常，在 slurm 账面上一直空闲，于是不断吸走新任务。详见 AGENTS.md「已知坏卡」。
+# 本档的启动检查走 torch，runtime 起不来时 is_available() 为 False、作业直接拒绝启动，
+# 所以这个失效模式对我们是响的而不是静默的——排除它只是为了省下崩之前那 10–35 分钟的
+# 数据加载。slurm 的 --gres 不能指定设备号，只能排整个节点。
+#SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-7,deep-chungus-8,deep-gpu-10,deep-gpu-11
 # One task; torchrun forks one process per GPU inside it.  --gres and --mem are
 # passed on the sbatch command line so NGPU can vary without editing this file.
 #SBATCH --nodes=1
