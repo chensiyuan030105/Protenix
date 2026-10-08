@@ -293,10 +293,33 @@ def score(trainer: Any, *, step: int, arm: str, out_dir: Path,
     #     one exists is not part of it.
     #
     # os.replace is one rename syscall, so the final path is either the old
-    # complete file or the new complete file and never anything else.  The
-    # reader's glob does not match `.part`, so a leftover is invisible rather
-    # than half-read.
-    part = path.with_name(path.name + ".part")
+    # complete file or the new complete file and never anything else.
+    #
+    # Three things in the temporary name, each for a different failure:
+    #
+    #   **the pid** -- a fixed `.part` is itself a contention point.  The
+    #     standalone sweeps all write into one shared runs/p010/sigma_grid, so
+    #     two scorings of the same arm and step (a FORCE=1 rescore submitted
+    #     while the first is still alive, or the same ARMS/SUFFIX submitted
+    #     twice -- which nearly happened with 2149584/2149586) would be two
+    #     writers on one temporary file and would interleave their rows.
+    #     Raised by the P006 session, who hit it with three replicas of one
+    #     array writing a shared directory.
+    #
+    #   **the leading dot** -- `glob.glob("*.jsonl")` and the shell both skip
+    #     dotfiles, so a leftover is invisible to anything written that way.
+    #
+    #   **the trailing `.part`** -- because `pathlib.Path.glob` does *not*
+    #     skip dotfiles (measured: Path.glob("*.jsonl") returns
+    #     ".tmp.9.x.jsonl", glob.glob does not, python 3.12.14), and the
+    #     reader here is pathlib.  So the dot alone would not hide it from a
+    #     future `*.jsonl` in this file.
+    #
+    # The reader's current pattern, `{arm}_step{step}.rank*.jsonl`, is already
+    # proof against both forms -- it is anchored on the arm name at one end and
+    # the extension at the other.  Both markers are here so that it stays true
+    # of a pattern somebody writes later without reading this comment.
+    part = path.with_name(f".tmp.{os.getpid()}.{path.name}.part")
     shard = windows[DIST_WRAPPER.rank::DIST_WRAPPER.world_size]
     written = 0
     try:
