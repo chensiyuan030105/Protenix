@@ -71,6 +71,93 @@ def eval_rounds(max_steps: int, eval_interval: int) -> list[int]:
     return rounds
 
 
+def check_readout_on_fixture() -> None:
+    """Drive kineidos.read_sigma_grid over four tiny arms.
+
+    Written because two readout jobs died on NameError -- a name that lives in
+    score_sigma_grid being used in read_sigma_grid -- after loading 45,000 rows
+    each.  Nothing about those failures needed real data to find; they needed
+    the code path to be executed at all.  Four arms of two windows exercise
+    every table the real readout prints, in about a second.
+
+    A fixture rather than the real files, so this says nothing about the
+    numbers and cannot start passing or failing because an arm was rerun.
+    """
+    import json
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    from kineidos.score_sigma_grid import (band_of, c_skip_of, edm_scale_of,
+                                           sigma_grid)
+
+    tmp = Path(tempfile.mkdtemp(prefix="p010_check_readout_"))
+    grid = sigma_grid()
+    arms = {"p009_random": 1.02, "p009_zero": 1.00,
+            "p009_zero_seed2": 1.01, "p009_none": 0.99}
+    # Two windows, one in dt bin 1 and one in bin 3, so the dt-split table has
+    # something in more than one row.
+    windows = [(0, 1, 0.1), (1, 8, 0.8)]
+    for arm, scale in arms.items():
+        path = tmp / f"{arm}_step2999.rank0.jsonl"
+        with open(path, "w") as handle:
+            for wid, stride, dt in windows:
+                for sig in grid:
+                    for noise in range(2):
+                        base = (1.0 + sig / 16.0) * (1.0 + 0.1 * noise)
+                        handle.write(json.dumps({
+                            "arm": arm, "step": 2999, "window_id": wid,
+                            "sample_id": "gagu_fixture_r4",
+                            "target_frame": 1000 + wid, "stride": stride,
+                            "delta_t_ns": dt, "sigma": sig, "noise_idx": noise,
+                            "mse_aligned": base * scale,
+                            "smooth_lddt": 0.3 * base * scale,
+                            "loss_unweighted": 2.0 * base * scale,
+                            "loss_edm_weighted": 3.0 * base * scale,
+                            "c_skip": c_skip_of(sig),
+                            "sigma_band": band_of(sig),
+                            "edm_scale": edm_scale_of(sig),
+                            "terms": {"mse_loss": base * scale,
+                                      "smooth_lddt_loss": 0.3 * base * scale,
+                                      "bond_loss": 0.0,
+                                      "loss": 3.0 * base * scale},
+                        }, sort_keys=True) + "\n")
+    out = tmp / "readout.md"
+    proc = subprocess.run(
+        [sys.executable, "-m", "kineidos.read_sigma_grid",
+         "--runs", str(tmp), "--step", "2999", "--out", str(out)],
+        capture_output=True, text=True)
+    check("the readout runs to completion", proc.returncode == 0,
+          (proc.stderr.strip().splitlines() or ["ok"])[-1][:120])
+    text = out.read_text() if out.is_file() else ""
+    for want in ("第 1 条", "逐 σ", "三箱 Δt", "zero − none"):
+        check(f"and its report contains {want!r}", want in text,
+              f"{len(text)} bytes written")
+    # The fixture makes random uniformly 2% worse than zero at every sigma, so
+    # the registered verdict must be the capacity branch -- same sign, same
+    # magnitude in all three bands.  That checks the verdict logic, not the
+    # data.
+    check("a uniform effect reads as the capacity branch",
+          "读到的是容量" in text,
+          "the fixture is random = 1.02 x zero at every sigma, which is "
+          "section 6 item 1's second branch by construction")
+
+    # And the truncation guard, since that is the other thing a readout must
+    # never do silently.
+    short = tmp / "p009_none_step2999.rank0.jsonl"
+    lines = short.read_text().splitlines()
+    short.write_text("\n".join(lines[:-3]) + "\n")
+    proc = subprocess.run(
+        [sys.executable, "-m", "kineidos.read_sigma_grid",
+         "--runs", str(tmp), "--step", "2999", "--out", str(out)],
+        capture_output=True, text=True)
+    check("a truncated arm is refused",
+          proc.returncode != 0 and "killed part way" in (proc.stdout + proc.stderr),
+          (proc.stdout + proc.stderr).strip().splitlines()[-1][:100]
+          if (proc.stdout + proc.stderr).strip() else "no output")
+
+
 def main() -> int:
     print("=== 1. the per-sigma keys exist, and default to today's behaviour ===")
     from kineidos.train.check_trainer import make_configs
@@ -170,6 +257,9 @@ def main() -> int:
         check("and a real arm still passes", True)
     except SystemExit as exc:
         check("and a real arm still passes", False, str(exc)[:80])
+
+    print("\n=== 5. the readout runs end to end on a synthetic fixture ===")
+    check_readout_on_fixture()
 
     print("\n" + "=" * 62)
     print("验收:", "全部通过" if not FAILS else f"{len(FAILS)} 项失败 -> {FAILS}")

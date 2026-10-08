@@ -56,6 +56,15 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+# At module level, and all of them.  The grid's definition lives in
+# score_sigma_grid and is imported rather than restated: a second copy would
+# let the reader and the scorer disagree about which z a sigma stands for, and
+# the z column is what the whole weighting argument rests on.  Importing them
+# one at a time inside whichever function needed them next cost two jobs
+# (2149439, 2149440) to two NameErrors.
+from kineidos.score_sigma_grid import (P_MEAN, P_STD, SIGMA_DATA, band_of,
+                                       c_skip_of)
+
 BANDS = ("high", "mid", "low")
 # stride bins, as P009 section 6.2 cut them: dt = stride * 0.1 ns.
 DT_BINS = (("bin1", 1, 2), ("bin2", 3, 5), ("bin3", 6, 10))
@@ -301,8 +310,6 @@ def per_sigma(arms: dict[str, dict[tuple, dict]], keys: list[tuple],
     loss weights by and the grid does not, which is the whole reason the two
     can disagree on the same checkpoint.
     """
-    from kineidos.score_sigma_grid import P_MEAN, P_STD, SIGMA_DATA
-
     sigmas = sorted({k[1] for k in keys})
     sigma_data = SIGMA_DATA
     lines = [f"| σ (Å) | z | 段 | c_skip | 训练抽样占比 | n | `{low}` | "
