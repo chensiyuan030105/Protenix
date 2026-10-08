@@ -369,7 +369,23 @@ class WorldParticleBridge(nn.Module):
             # h = x_target_canonical @ P, before wp_layernorm -- which is where
             # the real path hands over too, so the two differ in what h is and
             # in nothing else downstream.
-            return target.to(position.dtype) @ self.oracle_projection
+            #
+            # float32, with autocast explicitly off, and that is not a detail.
+            # The bridge is called from Protenix.forward, which train_step
+            # wraps in autocast(bfloat16); its output is consumed inside
+            # sample_diffusion_training, which configs' skip_amp runs with
+            # autocast DISABLED.  So wp_tokens has to be float32 -- the real
+            # path's tokens come out of WorldParticle's own network as float32
+            # and the fusion's weights are float32, which is why `random` has
+            # run for 10,000 steps.  A matmul *under* autocast returns
+            # bfloat16, so without this the oracle's h arrived as bf16 and
+            # _fuse_wp_tokens' diagnostics block -- a raw `h @ w.T` with no
+            # autocast to reconcile the two -- died with "expected mat1 and
+            # mat2 to have the same dtype" three minutes into both oracle arms
+            # (jobs 2149800 / 2149801).
+            with torch.autocast(device_type=position.device.type,
+                                enabled=False):
+                return (target.float() @ self.oracle_projection.float())
 
         self.assert_window_canonical(feats)
 
