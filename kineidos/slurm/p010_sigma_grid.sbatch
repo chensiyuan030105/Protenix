@@ -98,6 +98,22 @@ for entry in ${ARMS}; do
     TARGET="${RUN_DIR}/checkpoints/${STEP}.pt"
     [ -f "${TARGET}" ] || { echo "no checkpoint ${TARGET}" >&2; exit 1; }
   fi
+  # The resume path, which `background` makes mandatory and this job did not
+  # have: on 2026-10-08 a single tier-10 job on deep-chungus-10 preempted four
+  # of ours at once (PreemptExemptTime=0, no grace), and a requeue restarted
+  # the whole sweep from the first arm.  An arm's rows are worth ~14 minutes
+  # and the file is written once at the end, so finished arms should be skipped.
+  #
+  # The marker, not the jsonl's existence: a preemption mid-arm leaves a
+  # partial file behind, and "the file is there" would skip it and leave a
+  # truncated arm in the readout looking like a complete one.  The marker is
+  # written only after python exits 0.
+  DONE="${OUT}/.done_${ARM}${SUFFIX}_step${STEP}"
+  if [ -f "${DONE}" ] && [ "${FORCE:-0}" != "1" ]; then
+    echo ""
+    echo "=== ${ARM}: already done (${DONE}); FORCE=1 to rescore ==="
+    continue
+  fi
   echo ""
   echo "=== ${ARM} (wp.mode=${MODE}) <- ${TARGET} ==="
   # A scratch base_dir per arm: the trainer creates a run directory and writes
@@ -127,6 +143,7 @@ for entry in ${ARMS}; do
       --kineidos.sigma_grid_noise "${SIGMA_NOISE}" \
       --kineidos.sigma_grid_out "${OUT}" \
       "$@"; then
+    : > "${DONE}"
     echo "=== ${ARM}: ok ==="
   else
     # One arm failing must not throw away the arms that already scored: the
