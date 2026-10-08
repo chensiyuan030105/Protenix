@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -276,10 +277,30 @@ def score(trainer: Any, *, step: int, arm: str, out_dir: Path,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{arm}_step{step}.rank{DIST_WRAPPER.rank}.jsonl"
+    # Written aside and renamed, never opened in place.  Two failures this
+    # closes, and the P006 session walked into the second one today badly
+    # enough to lose two systems' equilibration output:
+    #
+    #   * a preemption mid-scoring used to leave a truncated jsonl where there
+    #     had been nothing, and `background` has no grace period -- two such
+    #     files, at 3659 and 3720 rows against 11264, sat in
+    #     runs/p010/sigma_grid beside two complete arms;
+    #   * worse, a rescoring (the .done marker's fingerprint not matching, so
+    #     the code has moved) used to truncate a *complete* file to zero the
+    #     instant open(..., "w") ran, and if that rescoring was then preempted
+    #     the good rows were gone.  "The state cannot be trusted, so redo it"
+    #     is a correct judgement; destroying the old artefact before the new
+    #     one exists is not part of it.
+    #
+    # os.replace is one rename syscall, so the final path is either the old
+    # complete file or the new complete file and never anything else.  The
+    # reader's glob does not match `.part`, so a leftover is invisible rather
+    # than half-read.
+    part = path.with_name(path.name + ".part")
     shard = windows[DIST_WRAPPER.rank::DIST_WRAPPER.world_size]
     written = 0
     try:
-        with open(path, "w") as handle:
+        with open(part, "w") as handle:
             for i, window in enumerate(shard):
                 batch = to_device(collate_window(window), trainer.device)
                 pred, label, _ = model(
@@ -359,6 +380,8 @@ def score(trainer: Any, *, step: int, arm: str, out_dir: Path,
                     trainer.print(f"[sigma-grid] {arm} step {step}: "
                                   f"{i + 1}/{len(shard)} windows, "
                                   f"{written} rows")
+        # Only now, with every row written and the handle closed.
+        os.replace(part, path)
     finally:
         model.train_noise_sampler = saved_sampler
         model.diffusion_batch_size = saved_batch
