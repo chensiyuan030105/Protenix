@@ -68,7 +68,22 @@ def deep_update(d, u):
 
 
 def make_configs(mode: str, base_dir: str, *, max_steps: int = 2,
-                 wp_token_dim: int | None | str = "auto"):
+                 wp_token_dim: int | None | str = "auto",
+                 overrides: Mapping | None = None):
+    """The smoke test's config, with `overrides` merged in before parse.
+
+    `overrides` exists for callers that are not the smoke test -- P010's
+    kineidos.bench_step wants the production numbers rather than the CPU
+    defaults below.  It is merged into the dict *before* parse_configs for the
+    same reason kineidos/train/main.py sets wp_token_dim there: several of
+    these values are read in a constructor, so a value written onto an
+    already-parsed config is read or ignored depending on which key it is, and
+    nothing says which.  triangle_attention is read by Pairformer's
+    constructor, diffusion_batch_size by Protenix.__init__ (protenix.py:159),
+    while N_step_mini_rollout is read at forward time -- three different
+    answers to "is it too late", from one line of assignment each.  Merging
+    before parse makes the question not arise.
+    """
     from configs.configs_base import configs as configs_base
     from configs.configs_data import data_configs
     from configs.configs_model_type import model_configs
@@ -109,6 +124,8 @@ def make_configs(mode: str, base_dir: str, *, max_steps: int = 2,
     dim = wp_token_dim_for(mode) if wp_token_dim == "auto" else wp_token_dim
     if dim is not None:
         base["model"]["diffusion_module"]["wp_token_dim"] = dim
+    if overrides:
+        deep_update(base, copy.deepcopy(dict(overrides)))
     return parse_configs(configs=base, arg_str=f"--model_name {name}",
                          fill_required_with_null=True)
 
