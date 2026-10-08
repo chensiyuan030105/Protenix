@@ -43,12 +43,17 @@ EXCLUDE="${EXCLUDE:-deep-h-1,deep-h-2,deep-h-3,deep-chungus-3,deep-chungus-4,dee
 
 # arm | tree | wp.mode | extra --export fields | extra trailing args
 # Section 5's table, in the same order.
+# Section 6 item 2's gate needs exactly four of these -- oracle, oracle-decoy,
+# random-1gpu, zero-1gpu -- and the gate is what decides where P011 goes.  So
+# those four are submitted first: with fewer than eight slots free, slurm
+# starts jobs in submission order, and a partial start should be a readable
+# gate rather than four arms of a table that cannot be read yet.
 read -r -d '' TABLE <<'EOF' || true
+oracle|ORACLE|oracle||--wp.oracle_source target
+oracle-decoy|ORACLE|oracle||--wp.oracle_source decoy
 random-1gpu|DIAG|random||
 zero-1gpu|DIAG|zero||
 random-1gpu-seed2|DIAG|random|SEED=43|
-oracle|ORACLE|oracle||--wp.oracle_source target
-oracle-decoy|ORACLE|oracle||--wp.oracle_source decoy
 oracle-noaug|ORACLE|oracle||--wp.oracle_source target --wp.target_augmentation false
 gamma-freeze-A|GAMMA|random||--wp.freeze_layernorm_until_step 2000
 gamma-freeze-B|GAMMA|random||--wp.freeze_layernorm_until_step 1000
@@ -62,10 +67,24 @@ want_tag () {
   git -C "${tree}" tag --points-at HEAD | grep -qx "${tag}"
 }
 
+# DEPEND short-circuits the tag check, and only that: when the arms are
+# submitted as the tail of a dependency chain, the acceptance jobs ARE the
+# gate -- slurm's afterok will not start an arm if the identity check exits
+# non-zero, and that check now stamps the three tags itself.  Checking for
+# tags at submit time would be checking for something that cannot exist yet.
+if [ -n "${DEPEND:-}" ]; then
+  echo "DEPEND=${DEPEND}: the tag check is the dependency's job."
+  echo "afterok will hold the arms until the identity check passes, and that"
+  echo "check stamps p010-base / p010-oracle / p010-gamma on its way out."
+  echo ""
+fi
+
 MISSING=""
-want_tag "${DIAG}"   p010-base   || MISSING="${MISSING} ${DIAG}:p010-base"
-want_tag "${ORACLE}" p010-oracle || MISSING="${MISSING} ${ORACLE}:p010-oracle"
-want_tag "${GAMMA}"  p010-gamma  || MISSING="${MISSING} ${GAMMA}:p010-gamma"
+if [ -z "${DEPEND:-}" ]; then
+  want_tag "${DIAG}"   p010-base   || MISSING="${MISSING} ${DIAG}:p010-base"
+  want_tag "${ORACLE}" p010-oracle || MISSING="${MISSING} ${ORACLE}:p010-oracle"
+  want_tag "${GAMMA}"  p010-gamma  || MISSING="${MISSING} ${GAMMA}:p010-gamma"
+fi
 if [ -n "${MISSING}" ]; then
   echo "refusing to submit: these tags do not point at their worktree's HEAD:" >&2
   for m in ${MISSING}; do echo "    ${m}" >&2; done
@@ -108,8 +127,19 @@ while IFS='|' read -r ARM TREEVAR MODE EXTRA_EXPORT EXTRA_ARGS; do
   CMD=(sbatch --parsable
        --gres=gpu:a100:1 --cpus-per-task=8 --mem=96G --nodes=1
        --exclude="${EXCLUDE}"
-       --export="${EXPORTS}"
-       "${DIAG}/kineidos/slurm/p010_train.sbatch")
+       --export="${EXPORTS}")
+  # high-priority by default now, which D3 could not use: its 12-GPU
+  # allowance was taken by P009's four arms.  Eight arms at one GPU fit under
+  # that cap and under the QoS's GrpJobs=8, and tier 10 is not preempted --
+  # which matters because one tier-10 job of somebody else's took out four of
+  # our background jobs in the same second today, and a preempted 2000-step
+  # arm has to resume, which is the path the provenance gate had to be built
+  # for.  While P009 still holds the 12 GPUs these simply queue on
+  # QOSGrpGpuLimit and drain in as its arms finish, which is what "queue
+  # behind P009" means.
+  [ -n "${PARTITION:-high-priority}" ] && CMD+=(--partition="${PARTITION:-high-priority}" --qos="${PARTITION:-high-priority}")
+  [ -n "${DEPEND:-}" ] && CMD+=(--dependency=afterok:"${DEPEND}")
+  CMD+=("${DIAG}/kineidos/slurm/p010_train.sbatch")
   # shellcheck disable=SC2086
   [ -n "${EXTRA_ARGS}" ] && CMD+=(${EXTRA_ARGS})
   if [ "${DRY:-0}" = "1" ]; then

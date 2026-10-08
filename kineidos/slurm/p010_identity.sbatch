@@ -229,4 +229,38 @@ done
 } >> "${REPORT}"
 
 cat "${REPORT}"
-[ -z "${FAILED}" ]
+[ -z "${FAILED}" ] || exit 1
+
+# The job that verifies is the job that stamps.  Section 6 item 5a gates
+# p010-base and item 5b gates the other two, and until now the tags were
+# applied by hand after reading this report -- which means a dependency chain
+# that starts the arms on `afterok` would start them before the tags existed,
+# and their env.lock would record a commit with no tag against it.
+#
+# Local only, no push: the arms read local tags, and a job pushing to a remote
+# is a surprise nobody asked for.  Idempotent, because a requeue re-runs this.
+tag_tree () {
+  local tree="$1" tag="$2"
+  if git -C "${tree}" tag --points-at HEAD | grep -qx "${tag}"; then
+    echo "  ${tag} already points at $(git -C "${tree}" rev-parse --short HEAD)"
+    return 0
+  fi
+  if git -C "${tree}" rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+    echo "  refusing to move ${tag}: it exists on another commit"          "($(git -C "${tree}" rev-list -n1 --abbrev-commit "${tag}"))."          "A tag that moves is worse than no tag -- an env.lock citing it"          "would describe whichever commit it pointed at last." >&2
+    return 1
+  fi
+  git -C "${tree}" tag -a "${tag}" -m "P010: ${tag}, stamped by identity check job ${SLURM_JOB_ID:-none}"
+  echo "  ${tag} -> $(git -C "${tree}" rev-parse --short HEAD)"
+}
+
+echo ""
+echo "=== 恒等检查通过，打标签 ==="
+RC=0
+tag_tree "${BASE_TREE}" p010-base || RC=1
+for TREE in ${TREES}; do
+  case "$(basename "${TREE}")" in
+    *-diag-oracle) tag_tree "${TREE}" p010-oracle || RC=1;;
+    *-diag-gamma)  tag_tree "${TREE}" p010-gamma  || RC=1;;
+  esac
+done
+exit "${RC}"
