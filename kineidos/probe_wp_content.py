@@ -92,11 +92,23 @@ def resolve(root: torch.nn.Module, dotted: str) -> torch.nn.Module:
 def per_atom_fraction(t: torch.Tensor) -> float:
     """The fraction of squared magnitude that is not the cross-atom mean.
 
-    Atoms are the second-to-last axis everywhere here ([N, C] or [1, N, C]).
+    `t` must be `[N, C]` or `[1, N, C]`, atoms on the leading axis after the
+    optional squeeze.  **Raises on anything else**, and that is why: the first
+    version silently accepted `[F, N, 1]`, failed the `shape[0] == 1` squeeze,
+    and averaged over the *frame* axis -- so a number reported as "per-atom
+    fraction of |d_anchor|" was in fact its across-frame fraction.  A wrong
+    axis gives a plausible number, which is the kind of error that only an
+    assertion catches.
     """
     x = t.detach().float()
     if x.dim() == 3 and x.shape[0] == 1:
         x = x[0]
+    if x.dim() != 2:
+        raise ValueError(
+            f"per_atom_fraction needs [N, C] (atoms leading), got "
+            f"{tuple(t.shape)}. Reduce the frame axis at the call site; "
+            f"averaging over it here is what produced a mislabelled number."
+        )
     mean = x.mean(dim=0, keepdim=True)
     total = x.pow(2).sum()
     const = mean.pow(2).sum() * x.shape[0]
@@ -476,15 +488,37 @@ def main() -> int:
                         (pos_f[1:] - pos_f[:-1]).norm(dim=-1)])
     geom = {"adjacent_rmsd_nm": float(np.mean(adj_rmsd)),
             "span_rmsd_nm": span_rmsd, "span_ns": win.delta_t_ns * (nfm - 1)}
-    print(f"\n  {'candidate scalar':<22} {'rms':>10} {'per-atom':>10} "
-          f"{'cos(oldest,newest)':>19}")
-    for nm, t in (("|d_anchor|", d_anchor), ("|d_step|", d_step)):
-        pa = per_atom_fraction(t.unsqueeze(-1).float())
-        c = cos(per_atom_part(t[1].unsqueeze(-1).float()),
-                per_atom_part(t[-1].unsqueeze(-1).float()))
-        geom[nm] = {"rms": float(t.pow(2).mean().sqrt()),
-                    "per_atom_fraction": pa, "cos_first_last_frame": c}
-        print(f"  {nm:<22} {geom[nm]['rms']:>10.4f} {pa:>9.2%} {c:>19.6f}")
+    print(f"\n  candidate motion features (vector vs its own magnitude):")
+    # **Vector against magnitude, and this is the measurement that decides
+    # whether the encoder has to be equivariant rather than merely invariant.**
+    # The displacement is a type-1 quantity: under a rotation it maps to R.d.
+    # Its magnitude is a scalar, hence invariant, which is why the invariance
+    # requirement pushed towards |d| -- but taking the norm discards the
+    # direction, and the direction is where the per-atom content is.  Both are
+    # measured per frame, with atoms on the leading axis, and averaged over
+    # frames; passing the frame axis into per_atom_fraction is the error the
+    # assertion above now refuses.
+    d_anchor_vec = pos_f - pos_f[0:1]                      # [F, N, 3]
+    d_step_vec = torch.cat([torch.zeros_like(pos_f[0:1]),
+                            pos_f[1:] - pos_f[:-1]])       # [F, N, 3]
+    for nm, vec, mag in (("d_anchor", d_anchor_vec, d_anchor),
+                         ("d_step", d_step_vec, d_step)):
+        # Frame 0 is identically zero for d_anchor and for d_step, so it is
+        # excluded: its per-atom fraction is undefined, not 0.
+        pa_vec = float(np.mean([per_atom_fraction(vec[k].float())
+                                for k in range(1, nfm)]))
+        pa_mag = float(np.mean([per_atom_fraction(mag[k].unsqueeze(-1).float())
+                                for k in range(1, nfm)]))
+        c = cos(per_atom_part(mag[1].unsqueeze(-1).float()),
+                per_atom_part(mag[-1].unsqueeze(-1).float()))
+        geom[nm] = {"rms": float(mag.pow(2).mean().sqrt()),
+                    "per_atom_fraction_vector": pa_vec,
+                    "per_atom_fraction_magnitude": pa_mag,
+                    "direction_share_lost_to_norm": pa_vec - pa_mag,
+                    "cos_first_last_frame_magnitude": c}
+        print(f"  {nm:<14} rms {geom[nm]['rms']:.4f} nm   "
+              f"per-atom: vector {pa_vec:>7.2%}  magnitude {pa_mag:>7.2%}   "
+              f"|.| cos(f1,f-1) {c:+.4f}")
     # The decisive one: does the candidate separate two *conformations* where
     # the current contract does not?  Compared on the same pair of windows
     # section 8 uses, so the numbers sit beside each other.
