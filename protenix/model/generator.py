@@ -372,6 +372,21 @@ def sample_diffusion_training(
     # training side the recycling and dropout -- and `oracle-noaug` would stop
     # being paired with `oracle` for a reason unrelated to the augmentation.
     # The cost is one wasted rotation per step.
+    # P010 readout section 15.4.  The bridge drew a rotation before this
+    # function ran and applied it to the oracle target; reuse it here so the
+    # target frame and h agree.  The full draw above is kept and discarded for
+    # the same reason centre_only keeps it: it consumes the RNG the other arms
+    # consume, so the noise levels below stay paired.
+    _ref = getattr(denoise_net, "wp_bridge_ref", None)
+    _shared = getattr(_ref, "last_rotation", None) if _ref is not None else None
+    if _shared is not None:
+        _x = label_dict["coordinate"]
+        _m = label_dict["coordinate_mask"]
+        _c = (_x * _m.unsqueeze(-1)).sum(-2) / (_m.sum(-1) + 1e-12)
+        _r = ((_x - _c.unsqueeze(-2)) @ _shared.T.to(_x.dtype))
+        x_gt_augment = _r.unsqueeze(-3).expand(
+            *_r.shape[:-2], N_sample, *_r.shape[-2:]).contiguous().to(dtype)
+
     if not getattr(denoise_net, "augment_target", True):
         x_gt_augment = centre_random_augmentation(
             x_input_coords=label_dict["coordinate"],

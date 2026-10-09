@@ -66,6 +66,11 @@ oracle-v2-decoy|ORACLE|oracle||--wp.oracle_source decoy --wp.oracle_encoding fou
 # molecule, 82% of the effect).  This one keeps the signal and destroys only
 # the atom-to-geometry correspondence.
 oracle-v2-shuffle|ORACLE|oracle||--wp.oracle_source target --wp.oracle_encoding fourier_anchor --wp.oracle_shuffle true
+# readout.md 15.4: a frame-bearing encoding, with and without making the frames
+# agree.  v3 against v2 is "bearing vs invariant"; v3-shared against v3 is
+# "does agreeing on the frame rescue a bearing encoding".
+oracle-v3|ORACLE|oracle||--wp.oracle_source target --wp.oracle_encoding fourier_coord
+oracle-v3-shared|ORACLE|oracle||--wp.oracle_source target --wp.oracle_encoding fourier_coord --wp.oracle_shared_rotation true
 gamma-freeze-A|GAMMA|random||--wp.freeze_layernorm_until_step 2000
 gamma-freeze-B|GAMMA|random||--wp.freeze_layernorm_until_step 1000
 EOF

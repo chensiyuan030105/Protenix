@@ -144,5 +144,63 @@ check("shuffle 确实打乱（不是恒等）",
       int((idx != torch.arange(N)).sum()) > N * 0.9,
       f"{int((idx != torch.arange(N)).sum())}/{N} 个原子换了位置")
 
+
+# --------------------------------------------------------------------------
+# readout.md 15.4: fourier_coord is the frame-BEARING control.  It must keep
+# v2's LayerNorm property (otherwise a failure is section 8's bug again, not
+# the frame) and it must NOT be invariant (otherwise it is not the control).
+# --------------------------------------------------------------------------
+from kineidos.wp_bridge import (ORACLE_COORD_LAMBDA_MAX_NM,  # noqa: E402
+                                oracle_coord_omega)
+
+print("\n=== oracle_encoding='fourier_coord'：带帧，但穿得过 LayerNorm ===")
+b3 = WorldParticleBridge("oracle", oracle_source="target",
+                         oracle_encoding="fourier_coord")
+h3 = h_of(b3, X)
+check("形状与 dtype", tuple(h3.shape) == (N, TOKEN_DIM)
+      and h3.dtype == torch.float32, f"{tuple(h3.shape)} {h3.dtype}")
+inv3 = float((h3 - h_of(b3, X @ Q.T + T)).abs().max())
+check("v3 **不是** SE(3) 不变的（它是带帧的对照）", inv3 > 1e-2,
+      f"旋转后最大差 {inv3:.3e}  ← 本该大")
+trans3 = float((h3 - h_of(b3, X + T)).abs().max())
+check("v3 对平移仍不变（已去质心）", trans3 < 1e-3, f"平移后最大差 {trans3:.3e}")
+d3 = float((LN(h3) - LN(h_of(b3, X * 1.1))).abs().max())
+check("v3 在 LN 之后仍分辨得出缩放（不是 §8 的病）", d3 > 1e-2, f"{d3:.3e}")
+s3 = h3.std(dim=-1, unbiased=False)
+check("v3 的 LN 归一化因子近乎常数", float(s3.std() / s3.mean()) < 0.05,
+      f"相对离散 {float(s3.std() / s3.mean()):.4f}")
+# 坐标可恢复：最长波长那一档的相位就是坐标（前提是 |x| < λ/2）
+c = (X - X.mean(0)).double()
+om = oracle_coord_omega(dtype=torch.float64)[0]
+ph = h3.double().reshape(N, 3, 2 * 128)
+rec = torch.atan2(ph[:, :, 0], ph[:, :, 128]) / om
+check("v3 的坐标可从最低频通道恢复（信息没丢）",
+      float((rec - c).abs().max()) < 1e-4,
+      f"最大坐标误差 {float((rec - c).abs().max()):.3e} nm；"
+      f"质心半径最大 {float(c.norm(dim=1).max()):.2f} nm < λ_max/2 = "
+      f"{ORACLE_COORD_LAMBDA_MAX_NM / 2:.1f} nm")
+
+print("\n=== oracle_shared_rotation：每次前向抽一个 R，h 与目标同帧 ===")
+b3s = WorldParticleBridge("oracle", oracle_source="target",
+                          oracle_encoding="fourier_coord",
+                          oracle_shared_rotation=True)
+ha, hb = h_of(b3s, X), h_of(b3s, X)
+check("每次前向换一个 R（不是固定的）",
+      float((ha - hb).abs().max()) > 1e-2,
+      f"两次前向最大差 {float((ha - hb).abs().max()):.3e}")
+check("R 被留给 generator 取用", b3s.last_rotation is not None
+      and tuple(b3s.last_rotation.shape) == (3, 3),
+      f"{None if b3s.last_rotation is None else tuple(b3s.last_rotation.shape)}")
+R = b3s.last_rotation.double()
+check("R 是一个正交的旋转（det=+1）",
+      bool(torch.allclose(R @ R.T, torch.eye(3, dtype=torch.float64), atol=1e-5))
+      and float(torch.det(R)) > 0.99,
+      f"det = {float(torch.det(R)):.6f}")
+# h 必须等于「先把目标按 R 转过、再用不带共用旋转的编码器算」
+h_manual = h_of(b3, (c @ R.T).float())
+check("h 确实是 R 作用之后的编码（与手工旋转一致）",
+      float((hb.double() - h_manual.double()).abs().max()) < 1e-3,
+      f"最大差 {float((hb.double() - h_manual.double()).abs().max()):.3e}")
+
 print("\n全部通过" if not fails else f"\n未通过：{fails}")
 sys.exit(1 if fails else 0)

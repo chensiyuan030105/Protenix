@@ -583,6 +583,12 @@ kineidos_configs = {
         # have no per-atom structure at all while the open question is whether
         # per-atom structure suffices without being correct.
         "oracle_shuffle": False,
+        # readout.md section 15.4.  "fourier_coord" is the frame-BEARING
+        # counterpart of "fourier_anchor": same LayerNorm property, same
+        # frequency floor, but it encodes the coordinates rather than the
+        # distances, so a rotation changes it.  It exists to ask whether a
+        # non-invariant encoder works once the frames are made to agree.
+        "oracle_shared_rotation": False,
     },
     "kineidos": {
         "gagu_root": (

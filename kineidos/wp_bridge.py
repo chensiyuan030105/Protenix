@@ -58,7 +58,13 @@ TOKEN_DIM = 768
 # below is there because changing either without the other would silently
 # produce a differently shaped h and the fusion's width check would blame the
 # caller.
-ORACLE_ENCODINGS = ("linear", "fourier_anchor")
+ORACLE_ENCODINGS = ("linear", "fourier_anchor", "fourier_coord")
+ORACLE_M_FREQ_COORD = 128          # 3 axes x 128 x 2 (sin, cos) = TOKEN_DIM
+# The long wavelength must exceed the molecule's full centred span or the
+# lowest channel wraps and the coordinate stops being recoverable; centred
+# GAGU reaches ~3.5 nm.  The short end is fourier_anchor's, measured there.
+ORACLE_COORD_LAMBDA_MAX_NM = 8.0
+ORACLE_COORD_LAMBDA_MIN_NM = 0.25
 ORACLE_K_ANCHOR = 8
 ORACLE_M_FREQ = 48
 # Wavelengths from the molecule's own size down to 0.25 nm.  Not finer: at a
@@ -88,6 +94,27 @@ def oracle_anchor_index(n_atom: int, device=None) -> torch.Tensor:
     run, so nothing has to be stored or matched at resume."""
     return torch.linspace(0, n_atom - 1, ORACLE_K_ANCHOR,
                           device=device).round().long()
+
+
+def oracle_coord_omega(device=None, dtype=torch.float32) -> torch.Tensor:
+    lam = torch.logspace(math.log10(ORACLE_COORD_LAMBDA_MAX_NM),
+                         math.log10(ORACLE_COORD_LAMBDA_MIN_NM),
+                         ORACLE_M_FREQ_COORD, device=device, dtype=dtype)
+    return 2.0 * math.pi / lam
+
+
+def oracle_coord_encode(target: torch.Tensor) -> torch.Tensor:
+    """[N, 3] -> [N, TOKEN_DIM].  Frame-BEARING on purpose.
+
+    Centred, so it is translation invariant and the 5.17 nm offset of the
+    canonical origin does not wrap every high-frequency channel.  Rotation
+    invariant it is not, and must not be: this is the control that asks what
+    a non-invariant encoding can do once the frames agree.
+    """
+    centred = target - target.mean(dim=0, keepdim=True)
+    phase = centred[..., None] * oracle_coord_omega(target.device, target.dtype)
+    return torch.cat([phase.sin(), phase.cos()],
+                     dim=-1).reshape(target.shape[0], TOKEN_DIM)
 
 
 def oracle_shuffle_index(n_atom: int, seed: int, device=None) -> torch.Tensor:
@@ -217,6 +244,7 @@ class WorldParticleBridge(nn.Module):
         oracle_seed: int = 20261008,
         oracle_encoding: str = "linear",
         oracle_shuffle: bool = False,
+        oracle_shared_rotation: bool = False,
     ) -> None:
         super().__init__()
         if mode not in MODES:
@@ -229,6 +257,11 @@ class WorldParticleBridge(nn.Module):
         self.oracle_seed: Optional[int] = None
 
         self.oracle_shuffle = bool(oracle_shuffle)
+        self.oracle_shared_rotation = bool(oracle_shared_rotation)
+        # Read by sample_diffusion_training off the diffusion module's
+        # reference to this bridge.  None until the first forward.
+        self.last_rotation = None
+        self._rot_gen = torch.Generator().manual_seed(int(oracle_seed) + 2)
         self.oracle_encoding = str(oracle_encoding)
         if self.oracle_encoding not in ORACLE_ENCODINGS:
             raise ValueError(
@@ -326,6 +359,7 @@ class WorldParticleBridge(nn.Module):
             "oracle_seed": self.oracle_seed,
             "oracle_encoding": self.oracle_encoding,
             "oracle_shuffle": self.oracle_shuffle,
+            "oracle_shared_rotation": self.oracle_shared_rotation,
             "oracle_k_anchor": ORACLE_K_ANCHOR,
             "oracle_m_freq": ORACLE_M_FREQ,
             "oracle_lambda_nm": [ORACLE_LAMBDA_MAX_NM, ORACLE_LAMBDA_MIN_NM],
@@ -452,6 +486,49 @@ class WorldParticleBridge(nn.Module):
                     f"window has {n_atom} atoms; these are the same atom set "
                     f"in the same order or the projection is nonsense"
                 )
+            if self.oracle_shared_rotation:
+                # One rotation per forward, shared by the whole diffusion
+                # batch.  Drawn here because the bridge runs before
+                # sample_diffusion_training (protenix.py:964 against :877) --
+                # which is precisely why h has always been in the canonical
+                # frame.  Own Generator, so the global stream other arms share
+                # is untouched.
+                # Built here rather than with protenix's
+                # uniform_random_rotation, which draws from the global stream:
+                # that would shift the noise levels every other arm draws and
+                # silently unpair the comparison.  QR of a Gaussian matrix is
+                # Haar-distributed on O(3) once the signs are fixed; flipping a
+                # column when the determinant is negative puts it on SO(3).
+                a = torch.randn(3, 3, generator=self._rot_gen,
+                                dtype=torch.float32)
+                q, rr = torch.linalg.qr(a)
+                q = q * torch.sign(torch.diagonal(rr)).unsqueeze(0)
+                if torch.det(q) < 0:
+                    q = q.clone()
+                    q[:, 0] = -q[:, 0]
+                self.last_rotation = q.to(target.device)
+                # autocast explicitly off, same as the encodings below and for
+                # the same reason -- and this one was caught by the acceptance
+                # rather than by reading: under autocast(bfloat16) the rotation
+                # matmul returns bf16, which rounds the coordinates to about
+                # three significant digits, and the 25 rad/nm channels turn
+                # that into a 0.41 difference in h.  Same shape as the oracle's
+                # original dtype bug (identity_check.md section 4): a matmul
+                # that looks like bookkeeping, under an autocast nobody was
+                # thinking about.
+                with torch.autocast(device_type=target.device.type,
+                                    enabled=False):
+                    centre = target.float().mean(dim=0, keepdim=True)
+                    target = (target.float() - centre) @ self.last_rotation.T
+            if self.oracle_encoding == "fourier_coord":
+                with torch.autocast(device_type=position.device.type,
+                                    enabled=False):
+                    h = oracle_coord_encode(target.float())
+                    if self.oracle_shuffle:
+                        idx = oracle_shuffle_index(h.shape[0], self.oracle_seed,
+                                                   device=h.device)
+                        h = h[idx]
+                    return h
             if self.oracle_encoding == "fourier_anchor":
                 # Same autocast discipline as the linear path below, and for
                 # the same reason: the bridge runs under autocast(bfloat16)

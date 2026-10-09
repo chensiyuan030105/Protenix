@@ -180,6 +180,7 @@ class KineidosTrainer(AF3Trainer):
             oracle_seed=cfg.oracle_seed,
             oracle_encoding=cfg.oracle_encoding,
             oracle_shuffle=cfg.oracle_shuffle,
+            oracle_shared_rotation=cfg.oracle_shared_rotation,
         )
         self.raw_model.wp_bridge = bridge.to(self.device)
         # P010 D-a.  Read by sample_diffusion_training off the denoise net,
@@ -187,6 +188,14 @@ class KineidosTrainer(AF3Trainer):
         # so that the switch lives in our config rather than in theirs.
         self.raw_model.diffusion_module.augment_target = bool(
             cfg.target_augmentation)
+        # So sample_diffusion_training can reuse the rotation the bridge drew.
+        # A reference, not a copy: the bridge rewrites last_rotation on every
+        # forward and the generator must see the current one.
+        self.raw_model.diffusion_module.wp_bridge_ref = (
+            bridge if cfg.oracle_shared_rotation else None)
+        if cfg.oracle_shared_rotation:
+            self.print("shared rotation: ON — the bridge draws one rotation "
+                       "per forward and the target frame reuses it")
         if not cfg.target_augmentation:
             self.print("target-frame augmentation: OFF (rotation = identity, "
                        "translation = 0, in training and in eval)")
