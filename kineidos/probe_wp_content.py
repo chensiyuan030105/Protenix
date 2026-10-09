@@ -443,6 +443,63 @@ def main() -> int:
           f"rms across atoms {across_atoms:.4e}, ratio "
           f"{frames['frame_to_atom_ratio']:.4e}")
 
+    # --------------------------------- what differs between frames, physically
+    # Section 8b says the frames differ by 1.7% at conv0.  This says what that
+    # 1.7% *is*, in nanometres, and then tests the one candidate the project's
+    # own literature note already measured and ranked
+    # (repos/literature/topics/history-featurization.md section 5.1, job
+    # 2149808): the per-atom displacement.
+    #
+    # `d_step` and `d_anchor` are measured there as **vectors** -- 99.96% /
+    # 99.91% per-atom, rms 9.8e-02 / 1.5e-01 nm, i.e. naturally on the same
+    # scale as the frame-time channel and only 7x below `ones`.  But a
+    # displacement vector rotates with the window, so feeding its three
+    # components would re-break D1 exactly as the velocity does (the symmetry
+    # probe puts that at 3598x).  Their **magnitudes** are scalars, hence
+    # invariant, and that is what is measured here: one channel each, which is
+    # what section 4 item 1 of that note says every paper has and our contract
+    # does not.
+    print("\n=== 8c. what differs between frames, in nanometres ===")
+    pos_f = pos[mask].double()
+    nfm = pos_f.shape[0]
+    adj_rmsd = [float((pos_f[i + 1] - pos_f[i]).pow(2).sum(-1).mean().sqrt())
+                for i in range(nfm - 1)]
+    span_rmsd = float((pos_f[-1] - pos_f[0]).pow(2).sum(-1).mean().sqrt())
+    print(f"  adjacent-frame RMSD  {np.mean(adj_rmsd):.4f} nm "
+          f"(min {min(adj_rmsd):.4f}, max {max(adj_rmsd):.4f})")
+    print(f"  oldest-to-newest     {span_rmsd:.4f} nm over "
+          f"{win.delta_t_ns * (nfm - 1):.2f} ns")
+    # d_anchor: displacement from the window's oldest (anchor) frame.
+    # d_step:   displacement from the previous frame.
+    d_anchor = (pos_f - pos_f[0:1]).norm(dim=-1)          # [F, N] scalars
+    d_step = torch.cat([torch.zeros(1, pos_f.shape[1], dtype=pos_f.dtype),
+                        (pos_f[1:] - pos_f[:-1]).norm(dim=-1)])
+    geom = {"adjacent_rmsd_nm": float(np.mean(adj_rmsd)),
+            "span_rmsd_nm": span_rmsd, "span_ns": win.delta_t_ns * (nfm - 1)}
+    print(f"\n  {'candidate scalar':<22} {'rms':>10} {'per-atom':>10} "
+          f"{'cos(oldest,newest)':>19}")
+    for nm, t in (("|d_anchor|", d_anchor), ("|d_step|", d_step)):
+        pa = per_atom_fraction(t.unsqueeze(-1).float())
+        c = cos(per_atom_part(t[1].unsqueeze(-1).float()),
+                per_atom_part(t[-1].unsqueeze(-1).float()))
+        geom[nm] = {"rms": float(t.pow(2).mean().sqrt()),
+                    "per_atom_fraction": pa, "cos_first_last_frame": c}
+        print(f"  {nm:<22} {geom[nm]['rms']:>10.4f} {pa:>9.2%} {c:>19.6f}")
+    # The decisive one: does the candidate separate two *conformations* where
+    # the current contract does not?  Compared on the same pair of windows
+    # section 8 uses, so the numbers sit beside each other.
+    w2 = _bw(samples[0], 1000, stride=10, k=args.window_k)
+    p2 = collate_window(w2)["input_feature_dict"]["wp_position_nm"]
+    p2 = p2[collate_window(w2)["input_feature_dict"]["wp_frame_mask"].to(torch.bool)].double()
+    d2 = (p2 - p2[0:1]).norm(dim=-1)
+    c_conf = cos(per_atom_part(d_anchor[-1].unsqueeze(-1).float()),
+                 per_atom_part(d2[-1].unsqueeze(-1).float()))
+    geom["d_anchor_cos_two_conformations"] = c_conf
+    print(f"\n  |d_anchor| between the two conformations of section 8: "
+          f"per-atom cos {c_conf:+.6f}")
+    print(f"  the current contract reaches {content['same_molecule_two_conformations']['h']['per_atom_cos']:+.6f} at `h` "
+          f"and {content['same_molecule_two_conformations']['conv0_molecular']['per_atom_cos']:+.6f} at conv0")
+
     # ---------------------------------------------------------- gate (2)
     print("\n=== 9. gate (2): reconstruction against the online log ===")
     recon = {"h_norm_after_layernorm": float(np.mean(h_norms)),
@@ -496,7 +553,8 @@ def main() -> int:
         "rotation_residual_with_contract": rot_resid,
         "rotation_per_atom_cos": rot_cos,
         "rotation_residual_by_layer": rot_by_layer,
-        "content": content, "frames": frames, "reconstruction": recon,
+        "content": content, "frames": frames, "geometry": geom,
+        "reconstruction": recon,
         "gates": gates, "pass": bool(ok),
     }
     if args.report:
