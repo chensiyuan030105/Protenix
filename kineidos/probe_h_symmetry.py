@@ -36,6 +36,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from kineidos import determinism
 from kineidos.window_align import canonicalize_window
 
 GAGU_DEFAULT = Path(
@@ -311,14 +312,65 @@ def main() -> int:
                     help="canonicalise each window before WorldParticle sees it "
                          "(kineidos/window_align.py); this is the remedy P004.1 "
                          "settled on, and with it h must come out invariant")
+    ap.add_argument("--zero-velocity", action="store_true",
+                    help="feed zeros in the velocity slot, which is P011 D2's "
+                         "contract. Without it this probe measures an "
+                         "architecture that is still being handed a lab-frame "
+                         "*vector*: `molecular_feats` is [ones, inp_vel, "
+                         "other_feats] and the three velocity components rotate "
+                         "with the window, so dense0_molecular cannot be "
+                         "invariant no matter what the convolution does. "
+                         "Measured on 2026-10-09: wp-v3 with real velocities "
+                         "leaves 7.5e-04 at stage 1 and 1.3e-04 at h, and the "
+                         "stage-1 figure matches the velocities' own relative "
+                         "weight in that concat (2.6e-04 against ones = 1.0, "
+                         "P009 10.7). So this flag is not a way of making the "
+                         "number smaller -- it is the difference between "
+                         "probing the contract the plan specifies and probing "
+                         "one it replaced.")
+    ap.add_argument("--exact-rotation", action="store_true",
+                    help="use a signed permutation of the axes instead of a "
+                         "generic rotation. It is a proper rotation (120 deg "
+                         "about (1,1,1), det +1) whose matrix entries are 0 "
+                         "and 1, so `pos @ R.T` is exact in float32 and "
+                         "introduces no rounding at all. That separates two "
+                         "things a generic rotation cannot: a residual that "
+                         "survives here is a real asymmetry in the "
+                         "architecture, while one that appears only under a "
+                         "generic rotation is the float32 storage of the "
+                         "rotated coordinates (~1e-7 absolute on 2.5 nm) "
+                         "amplified by the RBF's slope.")
+    ap.add_argument("--particle-radius", type=float, default=None,
+                    help="override pick_particle_radius. The default picks a "
+                         "radius giving ~24 neighbours from this geometry; "
+                         "pass 0.0778 to probe at the radius the bridge "
+                         "actually uses (0.35 nm cutoff, 51 neighbours "
+                         "median), since an invariance that held only at one "
+                         "neighbourhood size would not be an architectural "
+                         "property")
     ap.add_argument("--report", type=Path, default=None)
     args = ap.parse_args()
+
+    # Before anything is built or drawn.  See section 3b below for why this
+    # probe in particular cannot do without it.
+    determinism.enable()
 
     print("=== 1. input ===")
     pos, vel, ref = load_gagu_heavy(args.sample, n_frames=args.frames,
                                     window_from=args.window_from)
+    if args.zero_velocity:
+        vel = np.zeros_like(vel)
+        print("  velocity slot: ZEROS (P011 D2's contract)")
+    else:
+        print(f"  velocity slot: real, rms "
+              f"{float(np.sqrt((vel ** 2).mean())):.3e} nm/ps -- note this is "
+              f"a lab-frame vector and breaks rotation invariance by itself")
     n_frames, n, _ = pos.shape
-    radius = pick_particle_radius(pos[0])
+    if args.particle_radius is not None:
+        radius = float(args.particle_radius)
+        print(f"  particle_radius: {radius:.6f} nm  (given on the command line)")
+    else:
+        radius = pick_particle_radius(pos[0])
     extent = radius * WP_CONFIG["radius_scale"] * 6
     print(f"  particle_radius: {radius:.6f} nm  (config.yaml ships 0.012)")
     print(f"  filter_extent {extent:.4f} nm -> search cutoff {extent / 2:.4f} nm")
@@ -327,7 +379,15 @@ def main() -> int:
     model = build_model(radius, seed=args.seed)
     print(f"  {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params, eval mode")
 
-    R = random_rotation(args.seed + 1)
+    if args.exact_rotation:
+        # Cyclic permutation of the axes: 120 degrees about (1,1,1), det +1,
+        # entries 0 and 1, so the rotation itself costs no float32 rounding.
+        R = np.array([[0.0, 0.0, 1.0],
+                      [1.0, 0.0, 0.0],
+                      [0.0, 1.0, 0.0]])
+        print("  R: exact signed permutation (120 deg about (1,1,1))")
+    else:
+        R = random_rotation(args.seed + 1)
     print(f"  R: det = {np.linalg.det(R):+.6f}, "
           f"orthogonality err = {np.abs(R @ R.T - np.eye(3)).max():.2e}")
     t = np.array([1.7, -0.9, 2.3])
@@ -352,6 +412,42 @@ def main() -> int:
         if f == 0:  # translation needs no stacking: no fit is involved
             translated.append(run_once(model, p_tr[f], v_tr[f]))
         print(f"  frame {f + 1}/{n_frames} done")
+
+    # ===================================================================
+    # 3b. The noise floor: the same input, twice.
+    #
+    # P009's hard-won rule (section 8 item 8: "任何对 h 的测量，第一步必须是
+    # 「同一输入两次是否一致」"), and this probe did not have it.  The cost of
+    # not having it, measured on 2026-10-09 by jobs 2150572/2150574: two runs
+    # that differ only in which rotation matrix they use reported the
+    # canonicalisation residual -- a quantity in which no rotation appears at
+    # all -- as 1.97e-05 and 3.54e-04.  Same model, same seed, same window.
+    # The spread is run-to-run nondeterminism, and it is *larger* than the
+    # rotation residual being gated, so without this number the gate was
+    # reading its own noise.
+    #
+    # Where it comes from: `RadialMessagePassing` ends in an `index_add`, a
+    # parallel scatter whose summation order is not fixed; and the features at
+    # random initialisation are nearly constant across atoms (P009 10.7
+    # measured the per-atom part at 1.57e-07 of dense0's magnitude), so each
+    # RMSNorm divides the constant away and multiplies whatever per-atom
+    # difference remains -- including this one -- up towards O(1).  That is why
+    # a 1e-9 difference at stage 1 arrives as 1e-4 at `h`, and why the ratio
+    # below, not the absolute residual, is what says whether rotation changed
+    # anything.
+    # ===================================================================
+    print("\n=== 3b. noise floor: same input twice ===")
+    repeat = run_once(model, p_plain[0], v_plain[0])
+    self_resid = rel(flatten(plain[0][1]["3_super_particle_decoder"]),
+                     flatten(repeat[1]["3_super_particle_decoder"]))
+    self_stage = {}
+    for label, _attr, _kind in STAGES:
+        if label not in plain[0][1]:
+            continue
+        self_stage[label] = rel(flatten(plain[0][1][label]),
+                                flatten(repeat[1][label]))
+        print(f"  {label:<28} {self_stage[label]:>12.3e}")
+    print(f"  h (same input twice):        {self_resid:>12.3e}")
 
     out0, cap0 = plain[0]
     h = out0["tokens"]
@@ -395,6 +491,40 @@ def main() -> int:
                  flatten(translated[0][1]["3_super_particle_decoder"]))
     print(f"  h translation invariance  ||h(x+t)-h(x)|| / ||h(x)|| = {inv_tr:.4e}")
 
+    # P011 section 4.  `canonicalize_window` was P004's remedy for exactly the
+    # asymmetry D1 removes: it rotated the window into a fixed pose so that
+    # WorldParticle never saw an arbitrary one.  After D1 it must not matter,
+    # and that is a separate claim from "rotating the window does not matter":
+    # canonicalisation is a rotation *plus* a translation chosen from the data,
+    # so it exercises the composite.  On `wp-v2` this is a second positive
+    # control and has to come out O(1).
+    p_other, v_other, _ = prepare(pos, vel, ref, align=not args.align)
+    other = run_once(model, p_other[0], v_other[0])
+    inv_canon = rel(flatten(cap0["3_super_particle_decoder"]),
+                    flatten(other[1]["3_super_particle_decoder"]))
+    print(f"  h vs canonicalisation {'OFF' if args.align else 'ON'}  "
+          f"||h(a)-h(b)|| / ||h(a)|| = {inv_canon:.4e}")
+
+    # Is the residual at `h` an asymmetry, or is it ToMe's merge partition
+    # flipping?  The super-particle positions answer it directly and for free.
+    # They are means of the merged particles' own positions
+    # (cross_attn_feat.py's trace_source bmm), so *if the partition is the
+    # same*, sp(Rx) = R . sp(x) exactly -- to float32, with no network in
+    # between.  A residual here means different atoms were grouped together,
+    # which is a discrete decision taken on near-tied similarities: at random
+    # initialisation the features are nearly constant across atoms (P009 10.7
+    # put the per-atom part at 1.57e-07 of dense0's magnitude), so the
+    # k_partite matching is deciding between near-equal scores and the last
+    # bit of the input can change the answer.  That is the difference between
+    # "the architecture is not invariant" and "an invariant architecture
+    # contains a discrete step that is unstable at initialisation", and only
+    # the second is consistent with stage 1 being exact.
+    sp = flatten(out0["super_particle_positions"])
+    sp_rot = flatten(rotated[0][0]["super_particle_positions"])
+    sp_resid = rel(sp @ torch.tensor(R.T, dtype=sp.dtype), sp_rot)
+    print(f"  super-particle positions: ||sp(x).R - sp(Rx)|| / ||.|| = "
+          f"{sp_resid:.4e}   ({'same partition' if sp_resid < 1e-5 else 'PARTITION CHANGED'})")
+
     pc = out0["pos_correction"]
     pc_rot = rotated[0][0]["pos_correction"]
     equiv_pred = rel(pc @ torch.tensor(R.T, dtype=pc.dtype), pc_rot)
@@ -407,6 +537,13 @@ def main() -> int:
     h_stage = stage_results.get("3_super_particle_decoder", {})
     h_inv = h_stage.get("invariance_residual", float("nan"))
     h_lin = h_stage.get("linear", {}).get("held_out")
+    # An effect smaller than three times the noise floor is not an effect.
+    # The factor is 3 for the same reason the plan's read-out rule uses 3 over
+    # the seed floor: it is the smallest multiple at which a single
+    # measurement distinguishes the two.
+    inv_ratio = h_inv / self_resid if self_resid > 0 else float("inf")
+    print(f"\n  h rotation residual / noise floor = {h_inv:.3e} / "
+          f"{self_resid:.3e} = {inv_ratio:.2f}x")
     if h_inv < TOL:
         verdict = "INVARIANT"
     elif h_lin is not None and h_lin < TOL:
@@ -418,6 +555,8 @@ def main() -> int:
 
     print(f"\n  h rotation verdict: {verdict}")
     print(f"  h translation:      {'INVARIANT' if inv_tr < TOL else 'NOT invariant'}")
+    print(f"  h vs canonicalisation: "
+          f"{'AGREES' if inv_canon < TOL else 'DIFFERS'}")
     first_broken = next(
         (lbl for lbl, _a, _k in STAGES
          if lbl in stage_results and stage_results[lbl]["invariance_residual"] >= TOL),
@@ -430,6 +569,8 @@ def main() -> int:
 
     record = {
         "sample": str(args.sample), "seed": args.seed, "frames": n_frames,
+        "zero_velocity": bool(args.zero_velocity),
+        "exact_rotation": bool(args.exact_rotation),
         "window_from": args.window_from, "canonicalized": bool(args.align),
         "anchor_rmsd_to_ref": info.get("anchor_rmsd_to_ref"),
         "n_particles": n, "particle_radius": radius,
@@ -439,6 +580,13 @@ def main() -> int:
         "h_rotation_verdict": verdict,
         "h_translation_invariance_residual": inv_tr,
         "h_translation_invariant": inv_tr < TOL,
+        "super_particle_equivariance_residual": sp_resid,
+        "tome_partition_same": sp_resid < 1e-5,
+        "h_self_residual": self_resid,
+        "h_self_residual_by_stage": self_stage,
+        "h_rotation_over_noise_floor": inv_ratio,
+        "h_canonicalization_residual": inv_canon,
+        "h_canonicalization_agrees": inv_canon < TOL,
         "prediction_equivariance_residual": equiv_pred,
         "symmetry_first_lost_at": first_broken, "tolerance": TOL,
     }

@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from kineidos.window_align import canonicalize_window
+from kineidos.wp_features import OTHER_FEATS_CHANNELS, HistoryFeatureContract
 
 # Plan section 4.  `none` and `zero` do not run WorldParticle at all, which is
 # what keeps the ablation's control arms independent of it.
@@ -61,6 +62,29 @@ WP_CONFIG = dict(
     obstacle_feats_channels=3,
     verbose=False,
     velhead=True,
+    # P011 D1.  `particle_position_rope_dim` above is now inert -- the two 3D
+    # RoPEs it sized are gone -- but it is left in because `wp-v3` still
+    # accepts it and removing it from this dict would make the two configs
+    # diverge for no reason.  These three are what replaced it.
+    #
+    # 2.0 nm for the attention bias: attention is all-to-all, so unlike the
+    # convolution (bounded by the search radius) two atoms can be the whole
+    # diameter of the molecule apart.  GAGU's 470 heavy atoms span ~2.5 nm, so
+    # 16 centres at 0.13 nm spacing cover the molecule and the RBF's monotone
+    # tail channel keeps anything beyond it ordered rather than saturated.
+    distance_bias_cutoff=2.0,
+    distance_bias_num_basis=16,
+    # Per-branch LayerNorm on `other_feats` before the concat (D2 / STAR-MD
+    # A12).  See models/super_particle_layers.py for why this branch and not
+    # `ones` or the velocity slot.
+    normalize_other_feats=True,
+    # Per-branch LayerNorm on [conv0_out, dense0_out] before the
+    # `particle_features` concat.  Same rule as above, one concat later, and
+    # the checkup says it is the one that decides whether `h` carries
+    # conformation at all: raw, the per-atom cosine between two conformations
+    # goes from 0.9938 at conv0_molecular to 0.999991 at the concat, because
+    # dense0 sees no positions and is pure identity.
+    normalize_feature_branches=True,
 )
 K_PARTITE = 2
 
@@ -86,6 +110,13 @@ def wp_inputs_from_window(window) -> dict[str, torch.Tensor]:
 
     `canonicalized` becomes a 0-d tensor rather than staying a Python bool so
     that it survives to_device and any collation unchanged in kind.
+
+    `wp_velocity_nm_per_ps` is still collated and is no longer *consumed*:
+    P011 D2 feeds zeros down WorldParticle's velocity slot.  It stays in the
+    window and in this dict on purpose -- it is what makes "we stopped feeding
+    velocities" a reversible decision and a one-line ablation rather than a
+    data-pipeline change, and `forward` asserts against it so that the zeroing
+    is visible at the point of use instead of being a missing key.
     """
     return {
         "wp_position_nm": window.wp_position_nm,
@@ -110,9 +141,15 @@ class WorldParticleBridge(nn.Module):
         particle_radius_nm: see plan section 2.10.  Overridable because the
             ablation carries 0.0578 (0.26 nm cutoff) as an alternative.
         checkpoint: required by `pretrained`, which Stage 1 has not produced.
-        time_channels: how many channels of per-frame time to give
-            WorldParticle.  1 is the normalised position of the frame within
-            the window; see _frame_time_feature.
+        shuffle_h_seed: P011's `wp-inv-shuffle` arm.  Not None permutes `h`
+            along the atom axis with a fixed permutation, which keeps the
+            distribution of every channel and destroys the atom
+            correspondence -- the negative control that separates "the history
+            says something about *this* atom" from "the extra capacity
+            helps".  P010 13.5 is why it exists: the `decoy` control was zero
+            for a coordinate encoding and emphatically not zero for a distance
+            encoding, so a control has to be designed against the encoding it
+            is controlling for.
     """
 
     def __init__(
@@ -121,8 +158,8 @@ class WorldParticleBridge(nn.Module):
         *,
         particle_radius_nm: float = PARTICLE_RADIUS_NM,
         checkpoint: Optional[str | Path] = None,
-        time_channels: int = 1,
         seed: Optional[int] = None,
+        shuffle_h_seed: Optional[int] = None,
     ) -> None:
         super().__init__()
         if mode not in MODES:
@@ -130,8 +167,13 @@ class WorldParticleBridge(nn.Module):
         self.mode = mode
         self.token_dim = TOKEN_DIM
         self.particle_radius_nm = float(particle_radius_nm)
-        self.time_channels = int(time_channels)
+        self.shuffle_h_seed = shuffle_h_seed
+        self.features = None
         self.wp = None
+        # Lazily built and then cached as a buffer, so it is written into the
+        # checkpoint: a shuffle whose permutation changed between a run and its
+        # resume would be a third arm nobody launched.
+        self.register_buffer("shuffle_index", None, persistent=True)
 
         if mode in ("random", "pretrained"):
             # Imported here, not at module scope: `none` and `zero` must not
@@ -141,11 +183,27 @@ class WorldParticleBridge(nn.Module):
                 ParticleNetworkCrossAttnLocalFeature,
             )
 
+            # **Seed first, then build -- both of them.**  The contract holds
+            # the only learnable branch in the feature path (the atom-name
+            # embedding), and the first version of this constructor built it
+            # *above* the manual_seed, so those weights came from whatever
+            # global RNG state the process happened to be in.  Two checkup runs
+            # with identical arguments then reported conv0_molecular's per-atom
+            # fraction as 45.9% and 67.1%, which looks exactly like a code
+            # change and was in fact an unseeded embedding.  Caught by the
+            # inconsistency on 2026-10-09, before any arm ran; it would have
+            # made `wp-inv` and `wp-inv-seed2` differ by more than their
+            # nominal seeds and put that difference into the seed floor the
+            # whole read-out is measured against.
             if seed is not None:
                 torch.manual_seed(seed)
+            # P011 D2, plan section 5.1.  Built before WorldParticle, because
+            # its channel count is WorldParticle's `other_feats_channels` and
+            # the two must not be able to disagree.
+            self.features = HistoryFeatureContract()
             self.wp = ParticleNetworkCrossAttnLocalFeature(
                 particle_radius=self.particle_radius_nm,
-                other_feats_channels=self.time_channels,
+                other_feats_channels=self.features.channels,
                 **WP_CONFIG,
             )
 
@@ -259,14 +317,38 @@ class WorldParticleBridge(nn.Module):
         if not bool(mask.any()):
             raise ValueError("no valid history frame in this window")
 
+        # P011 D2.  Frame-independent, so it is built once and reused across
+        # the K frames rather than K times -- and, more to the point, so that
+        # "the identity does not depend on the frame" is a property of the code
+        # and not of a convention somebody has to maintain.
+        identity = self.features.identity(feats)
+        if identity.shape[0] != n_atom:
+            raise ValueError(
+                f"the contract produced identity for {identity.shape[0]} "
+                f"atoms but the history window has {n_atom}. These are the "
+                f"same 470 heavy atoms in the same order -- `h` is "
+                f"concatenated onto `c_l` position by position, so a mismatch "
+                f"here is a silently wrong model, not a shape error."
+            )
+
+        # P011 D2: zeros, not the collated velocities.  Built from `position`
+        # so dtype and device follow it.  Two reasons, and the second was
+        # measured rather than argued: the content is thin (2e-4 nm/ps at a 100
+        # ps save interval, P008 1.4), and the three components are a
+        # *lab-frame vector*, so feeding them re-breaks the rotation invariance
+        # D1 just built -- the symmetry probe puts that at 7.5e-04 against
+        # 2.5e-07 at the stage where both are consumed, a factor of 3000
+        # (artifacts/reports/P011/symmetry.md).
+        zero_vel = torch.zeros_like(position[0])
+
         tokens = []
         for k in range(position.shape[0]):
             if not bool(mask[k]):
                 continue
-            other = time_feat[k].expand(n_atom, self.time_channels).contiguous()
+            other = self.features(time_feat[k], identity)
             out = self.wp.compute_correction(
                 position[k],
-                feats["wp_velocity_nm_per_ps"][k],
+                zero_vel,
                 other,
                 None,
                 None,
@@ -276,4 +358,42 @@ class WorldParticleBridge(nn.Module):
             )
             tokens.append(out["tokens"])
 
-        return torch.stack(tokens).mean(dim=0)
+        h = torch.stack(tokens).mean(dim=0)
+        if self.shuffle_h_seed is not None:
+            h = h[self._shuffle_index(n_atom, h.device)]
+        return h
+
+    # -------------------------------------------------------------- shuffle
+
+    def _shuffle_index(self, n_atom: int, device) -> torch.Tensor:
+        """A fixed permutation of the atom axis, built once and checkpointed.
+
+        Distribution-preserving and correspondence-destroying: every channel's
+        values over atoms are exactly the ones WorldParticle produced, and
+        every one of them is attached to the wrong atom.  So this arm has the
+        same capacity, the same magnitudes, the same LayerNorm statistics and
+        the same gradient scale as `wp-inv`, and none of its per-atom
+        information -- which is the only way to read "the history is specific
+        to this conformation" off a difference between two arms (P010 14.5-14.6
+        measured 74% of the oracle effect that way).
+
+        Drawn from its own Generator, not the global RNG, for the reason the dt
+        pathway restores the global state: the shuffle arm must differ from
+        `wp-inv` in the permutation and in nothing else, and consuming global
+        draws at construction time would also change the model's
+        initialisation.
+        """
+        idx = self.shuffle_index
+        if idx is None or idx.numel() != n_atom:
+            if idx is not None:
+                raise ValueError(
+                    f"shuffle_index holds {idx.numel()} entries but this "
+                    f"window has {n_atom} atoms. The permutation is "
+                    f"checkpointed so that a resume cannot silently become a "
+                    f"different arm; a size change means the atom set changed "
+                    f"under it."
+                )
+            gen = torch.Generator().manual_seed(int(self.shuffle_h_seed))
+            idx = torch.randperm(n_atom, generator=gen)
+            self.shuffle_index = idx.to(device)
+        return self.shuffle_index.to(device)

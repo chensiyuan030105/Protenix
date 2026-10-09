@@ -50,6 +50,13 @@ def collate_window(window: Any) -> dict[str, Any]:
     # it inside forward rather than being called from outside, where DDP would
     # not reduce its gradients.
     feats.update(wp_inputs_from_window(window))
+    # P011 D4.  The physical time gap, as a tensor and in the feature dict, so
+    # that `to_device` moves it and DiffusionConditioning can read it the way
+    # it reads everything else.  It stays in `basic` as well -- read_heldout
+    # and the per-window rows index on it -- but `basic` never reaches the
+    # model, which is the whole reason the model had never been told dt (P009
+    # section 8 item 11, and the grep over six trees that found no reader).
+    feats["delta_t_ns"] = torch.tensor(float(window.delta_t_ns))
 
     label_dict = {k: v.clone() for k, v in window.labels.items()}
     label_full_dict = {k: v.clone() for k, v in window.labels.items()}
