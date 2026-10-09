@@ -28,5 +28,5 @@ export LD_LIBRARY_PATH="${ENV}/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONDONTWRITEBYTECODE=1
 echo "host $(hostname)  $(date -Is)"
 git -C repos/research/kineidos-v3-diag rev-parse --short HEAD
-"${ENV}/bin/python" -m kineidos.plot_sigma_arms --step 499
+"${ENV}/bin/python" -m kineidos.plot_arm_summary --step 999
 echo "done $(date -Is)"
