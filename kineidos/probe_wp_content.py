@@ -371,6 +371,78 @@ def main() -> int:
                       f"constant cos "
                       f"{content[label][lyr]['constant_cos']:+.6f}")
 
+    # ------------------------------------------- what the history contains
+    # The structural fact this measures: after D2 there is **exactly one** path
+    # from conformation into `particle_features`, namely the distance-dependent
+    # filter inside conv0_molecular.  `other_feats` is frame-independent except
+    # for one per-frame scalar (the frame index, identical across atoms), the
+    # velocity slot is zero, and `dense0_molecular` takes no positions.  So the
+    # eight history frames differ *only* in their geometry, and the bridge then
+    # mean-pools them.
+    #
+    # Which raises the question this section answers: how much do the eight
+    # frames differ at all, and does pooling them leave anything that one frame
+    # would not have given?  If `h(pooled)` is indistinguishable from `h(newest
+    # frame only)`, the window is costing 8x the forward passes for no
+    # information -- and no training arm can read a history effect that is not
+    # in `h`.
+    print("\n=== 8b. the eight history frames, and what pooling does ===")
+    from kineidos.data.windows import build_window as _bw
+
+    win = _bw(samples[0], 5000, stride=10, k=args.window_k)
+    wfeats = collate_window(win)["input_feature_dict"]
+    pos = wfeats["wp_position_nm"]
+    mask = wfeats["wp_frame_mask"].to(torch.bool)
+    time_feat = bridge._frame_time_feature(wfeats)
+    frame_acts, frame_tokens = [], []
+    with torch.no_grad():
+        ident = bridge.features.identity(wfeats)
+        zero_vel = torch.zeros_like(pos[0])
+        for k in range(pos.shape[0]):
+            if not bool(mask[k]):
+                continue
+            out = bridge.wp.compute_correction(
+                pos[k], zero_vel, bridge.features(time_feat[k], ident),
+                None, None, k_partite=2, return_tokens=True,
+                skip_output_network=True)
+            frame_tokens.append(out["tokens"])
+            frame_acts.append({k2: cap.acts[k2].clone() for k2, _ in HOOKS})
+    nf = len(frame_tokens)
+    print(f"  window: target {win.target_frame}, stride {win.stride}, "
+          f"dt {win.delta_t_ns:.3f} ns, {nf} real frames of {pos.shape[0]}")
+    print(f"  {'layer':<20} {'oldest vs newest':>18} {'adjacent frames':>18}")
+    frames = {}
+    for lyr in [k for k, _ in HOOKS]:
+        a = per_atom_part(frame_acts[0][lyr])
+        b = per_atom_part(frame_acts[-1][lyr])
+        adj = [cos(per_atom_part(frame_acts[i][lyr]),
+                   per_atom_part(frame_acts[i + 1][lyr]))
+               for i in range(nf - 1)]
+        frames[lyr] = {"oldest_vs_newest_cos": cos(a, b),
+                       "adjacent_cos_mean": float(np.mean(adj))}
+        print(f"  {lyr:<20} {frames[lyr]['oldest_vs_newest_cos']:>18.6f} "
+              f"{frames[lyr]['adjacent_cos_mean']:>18.6f}")
+    pooled = torch.stack(frame_tokens).mean(dim=0)
+    newest = frame_tokens[-1]
+    frames["pooled_vs_newest_cos"] = cos(per_atom_part(pooled),
+                                         per_atom_part(newest))
+    frames["pooled_vs_newest_rel"] = rel(pooled, newest)
+    print(f"  pooled over {nf} frames vs the newest frame alone: "
+          f"per-atom cos {frames['pooled_vs_newest_cos']:.6f}, "
+          f"rel {frames['pooled_vs_newest_rel']:.3e}")
+    # The spread across frames, against the spread across atoms, both on the
+    # per-atom part.  This is the ratio that says whether the history axis
+    # carries anything comparable to the identity axis.
+    stack = torch.stack([per_atom_part(t) for t in frame_tokens])
+    across_frames = float(stack.std(dim=0).pow(2).mean().sqrt())
+    across_atoms = float(stack.mean(dim=0).pow(2).mean().sqrt())
+    frames["across_frames_rms"] = across_frames
+    frames["across_atoms_rms"] = across_atoms
+    frames["frame_to_atom_ratio"] = across_frames / max(across_atoms, 1e-30)
+    print(f"  per-atom part: rms across frames {across_frames:.4e}, "
+          f"rms across atoms {across_atoms:.4e}, ratio "
+          f"{frames['frame_to_atom_ratio']:.4e}")
+
     # ---------------------------------------------------------- gate (2)
     print("\n=== 9. gate (2): reconstruction against the online log ===")
     recon = {"h_norm_after_layernorm": float(np.mean(h_norms)),
@@ -424,7 +496,7 @@ def main() -> int:
         "rotation_residual_with_contract": rot_resid,
         "rotation_per_atom_cos": rot_cos,
         "rotation_residual_by_layer": rot_by_layer,
-        "content": content, "reconstruction": recon,
+        "content": content, "frames": frames, "reconstruction": recon,
         "gates": gates, "pass": bool(ok),
     }
     if args.report:
