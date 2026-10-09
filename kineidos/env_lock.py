@@ -69,6 +69,17 @@ def _run(cmd: list[str], cwd: str | None = None) -> str | None:
     return out.stdout.strip() if out.returncode == 0 else None
 
 
+def code_trees(workspace: Path) -> dict[str, object]:
+    """The public name for _code_trees, for callers outside this module.
+
+    kineidos/train/trainer.py's resume gate needs the commits and tags of the
+    trees this process imports from, and needs them cheaply -- collect() also
+    runs pip freeze, which is seconds and writes a whole lock.  Same function,
+    so the gate and the lock cannot disagree about which tree is running.
+    """
+    return _code_trees(workspace)
+
+
 def _code_trees(workspace: Path) -> dict[str, object]:
     """The code trees this process imports from, derived rather than named.
 
@@ -105,15 +116,28 @@ def _code_trees(workspace: Path) -> dict[str, object]:
 
 
 def _worktree(path: Path) -> dict[str, object]:
-    """Commit and dirtiness of one worktree.  A dirty tree is recorded, not
-    rejected: refusing to run would be the wrong trade during development, but
-    a result from a dirty tree must never look like one from a clean tree."""
+    """Commit, tags and dirtiness of one worktree.  A dirty tree is recorded,
+    not rejected: refusing to run would be the wrong trade during development,
+    but a result from a dirty tree must never look like one from a clean tree.
+
+    Tags as well as the commit, because P010's nine arms are compared across
+    three branches and the thing that says an arm is comparable is the tag it
+    started from -- `p010-base`, `p010-oracle`, `p010-gamma` (P010 section 3,
+    and P009 section 6.1's lesson that the comparison should cite a tag rather
+    than a hash nobody can place).  `tags` is what points *at* HEAD, which is
+    empty on a branch that has moved on; `describe` always says something, and
+    the "-N-g<hash>" suffix is how far past the tag this tree is.
+    """
     p = str(path)
     status = _run(["git", "-C", p, "status", "--porcelain"])
+    tags = _run(["git", "-C", p, "tag", "--points-at", "HEAD"])
     return {
         "path": p,
         "commit": _run(["git", "-C", p, "rev-parse", "HEAD"]),
         "branch": _run(["git", "-C", p, "rev-parse", "--abbrev-ref", "HEAD"]),
+        "tags": tags.splitlines() if tags else [],
+        "describe": _run(["git", "-C", p, "describe", "--tags", "--always",
+                          "--dirty"]),
         "dirty": bool(status) if status is not None else None,
         "dirty_files": status.splitlines() if status else [],
     }
@@ -199,7 +223,9 @@ def main() -> int:
     print(f"wrote {out_dir / 'env.lock'}")
     for label, wt in record["worktrees"].items():
         flag = " [DIRTY]" if wt["dirty"] else ""
-        print(f"  {label:12s} {str(wt['commit'])[:12]} ({wt['branch']}){flag}")
+        tag = f" @{','.join(wt['tags'])}" if wt.get("tags") else ""
+        print(f"  {label:12s} {str(wt['commit'])[:12]} "
+              f"({wt['branch']}){tag}{flag}")
     o3d = record["open3d"]
     if o3d.get("matches_installed_torch") is False:
         print("  WARNING: open3d was built for torch "

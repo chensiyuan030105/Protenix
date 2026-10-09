@@ -32,7 +32,7 @@ import torch
 
 from protenix.utils.distributed import DIST_WRAPPER
 
-from kineidos import observables
+from kineidos import atomic, observables
 from kineidos.seeding import set_all_seeds
 from kineidos.checkpoint import FUSION_KEYS, load_checkpoint
 from kineidos.train.batch import collate_fn_window
@@ -114,14 +114,26 @@ class KineidosTrainer(AF3Trainer):
             "alpha_distogram": self.configs.loss.weight.alpha_distogram,
             "alpha_diffusion": self.configs.loss.weight.alpha_diffusion,
         }
-        path = os.path.join(self.run_dir, "env.lock")
-        with open(path, "w") as handle:
-            handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        # Atomic, for the same reason as everything else this project writes:
+        # `background` preempts with no grace period.  A half-written env.lock
+        # is worse than an absent one -- it is invalid JSON, so every reader
+        # that parses it (read_heldout's oracle refusal, the resume provenance
+        # gate) falls through its JSONDecodeError handler and reports the run
+        # as unverifiable, which is indistinguishable from a run that was
+        # never locked.  See kineidos/atomic.py.
+        path = Path(self.run_dir) / "env.lock"
+        atomic.write_json(path, record)
         self.print(f"env.lock -> {path}")
         for label, worktree in record["worktrees"].items():
             dirty = " [DIRTY]" if worktree["dirty"] else ""
+            # The tag as well as the hash.  P010 compares nine arms across
+            # three branches and the tag is what says an arm is comparable
+            # (p010-base / p010-oracle / p010-gamma); a hash in a log is not
+            # something a reader can place.
+            tags = worktree.get("tags") or []
+            tag = f" @{','.join(tags)}" if tags else ""
             self.print(f"  {label:12s} {str(worktree['commit'])[:12]} "
-                       f"({worktree['branch']}){dirty}")
+                       f"({worktree['branch']}){tag}{dirty}")
 
     # ------------------------------------------------------------- model
 
@@ -257,7 +269,47 @@ class KineidosTrainer(AF3Trainer):
         # 3 GB file to add one string is not worth it, and a sidecar can be read
         # without torch.load.
         (link.parent / "latest.arm").write_text(self.configs.wp.mode + "\n")
+        self.write_resume_provenance(link.parent)
         self.print(f"latest.pt -> {saved}")
+
+    def write_resume_provenance(self, where: Path) -> None:
+        """Which code wrote this checkpoint, beside the checkpoint.
+
+        The input-fingerprint gate the P006 session arrived at from four
+        separate silent-corruption incidents, applied to the one place P010
+        reuses an upstream artefact: `latest.pt`.
+        
+        The shape of the hazard here.  The diagnostic arms are 2000 steps on
+        `background`, which preempts with no grace period, and resume() reloads
+        latest.pt.  Development happens in the same worktree -- 22 commits to
+        this tree in one session.  So an arm can be preempted, the tree can
+        move, and the requeued arm resumes an optimizer state written by code
+        that no longer exists, while its env.lock records the *new* commit.
+        Every existing gate is green: latest.arm matches, the state_dict loads
+        with nothing missing, the loss curve continues smoothly.  Nothing says
+        the run is now two code versions stitched together.
+        """
+        import json
+
+        from kineidos.env_lock import code_trees, find_workspace_root
+
+        try:
+            trees = code_trees(find_workspace_root())
+        except Exception as exc:                            # noqa: BLE001
+            # Never let provenance bookkeeping lose a checkpoint.  A missing
+            # sidecar makes the gate say "cannot verify", which is the right
+            # answer and is not silence.
+            self.print(f"[resume] could not record provenance: {exc}")
+            return
+        record = {
+            "wp_mode": self.configs.wp.mode,
+            "step": self.step,
+            "trees": {name: {"commit": t.get("commit"), "tags": t.get("tags"),
+                             "dirty": t.get("dirty")}
+                      for name, t in trees.items()},
+        }
+        (where / "latest.provenance").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n")
 
     def resume(self, path: Path) -> bool:
         """Continue a run that was interrupted.  True if it actually resumed.
@@ -278,6 +330,7 @@ class KineidosTrainer(AF3Trainer):
                     f"every shared key and leave the bridge at initialisation, "
                     f"giving a run that is neither arm. Use a resume_dir per arm."
                 )
+        self.check_resume_provenance(path.parent)
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         state = checkpoint["model"]
         if next(iter(state)).startswith("module."):
@@ -294,6 +347,90 @@ class KineidosTrainer(AF3Trainer):
         self.global_step = self.step * self.iters_to_accumulate
         self.print(f"Resumed {self.configs.wp.mode!r} from {path} at step {self.step}")
         return True
+
+    def check_resume_provenance(self, where: Path) -> None:
+        """Refuse to resume a checkpoint that different code wrote.
+
+        Not a warning.  A warning in a slurm log that nobody reads until the
+        run is over is the same as no check: the arm would finish, look
+        normal, and be two code versions stitched at whatever step the
+        preemption happened.  There is no way to tell afterwards which half of
+        the curve came from which.
+
+        `kineidos.allow_resume_across_code` is the escape hatch, and it is a
+        config key rather than an environment variable so that using it is
+        recorded in the run's own env.lock.
+
+        A dirty tree on either side also refuses: "same commit" says nothing
+        when there are uncommitted edits, which is the normal state of a tree
+        somebody is working in.
+        """
+        import json
+
+        from kineidos.env_lock import code_trees, find_workspace_root
+
+        sidecar = where / "latest.provenance"
+        if not sidecar.is_file():
+            # Written by a run from before this check existed.  Say so rather
+            # than passing silently -- "cannot verify" is a different state
+            # from "verified".
+            self.print(
+                f"[resume] {sidecar} is absent, so which code wrote this "
+                f"checkpoint cannot be verified. Written before this check "
+                f"existed, or removed."
+            )
+            return
+        try:
+            was = json.loads(sidecar.read_text())
+            now_trees = code_trees(find_workspace_root())
+        except Exception as exc:                            # noqa: BLE001
+            self.print(f"[resume] could not check provenance: {exc}")
+            return
+
+        problems: list[str] = []
+        for name, then in (was.get("trees") or {}).items():
+            now = now_trees.get(name)
+            if now is None:
+                problems.append(f"{name}: was on PYTHONPATH, now is not")
+                continue
+            if then.get("commit") != now.get("commit"):
+                problems.append(
+                    f"{name}: checkpoint written at "
+                    f"{str(then.get('commit'))[:12]}"
+                    f"{' @' + ','.join(then.get('tags') or []) if then.get('tags') else ''}"
+                    f", now {str(now.get('commit'))[:12]}"
+                    f"{' @' + ','.join(now.get('tags') or []) if now.get('tags') else ''}")
+            if then.get("dirty") or now.get("dirty"):
+                problems.append(
+                    f"{name}: dirty tree ({'then' if then.get('dirty') else ''}"
+                    f"{' and ' if then.get('dirty') and now.get('dirty') else ''}"
+                    f"{'now' if now.get('dirty') else ''}), so the commit does "
+                    f"not identify the code")
+        if not problems:
+            self.print("[resume] provenance checks out: same code wrote this "
+                       "checkpoint")
+            return
+        if self.configs.kineidos.allow_resume_across_code:
+            self.print("[resume] CODE CHANGED UNDER THIS RUN, and "
+                       "kineidos.allow_resume_across_code says to continue:")
+            for p_ in problems:
+                self.print(f"  {p_}")
+            self.print("  this arm is two code versions stitched at the step "
+                       "the preemption happened; nothing downstream can tell "
+                       "which half is which")
+            return
+        raise ValueError(
+            "refusing to resume: the code changed since this checkpoint was "
+            "written.\n  " + "\n  ".join(problems) + "\n"
+            "The arms are 2000 steps on a preemptible partition and "
+            "development happens in the same worktree, so this is the normal "
+            "way a run becomes two code versions stitched together -- with "
+            "every other gate green: latest.arm matches, the state_dict loads "
+            "with nothing missing, the loss curve continues smoothly. Start "
+            "the arm again on one commit, or set "
+            "--kineidos.allow_resume_across_code true to say in the run's own "
+            "env.lock that you meant it."
+        )
 
     def try_load_checkpoint(self) -> None:
         """Resume if there is a run to resume, otherwise load the pretrained trunk.
@@ -489,8 +626,47 @@ class KineidosTrainer(AF3Trainer):
         self.print(f"[eval] step {self.step} over {n} held-out windows "
                    f"(N_cycle={self.configs.model.N_cycle}): {headline}")
 
+        # The per-sigma reading, on the same windows in the same round (P010
+        # D1).  Off by default, and after the per-window rows are already on
+        # disk: this is the new and less proven of the two, and a failure in it
+        # must not cost the round's held-out numbers.
+        if self.configs.kineidos.sigma_grid and self.sigma_grid_due():
+            from kineidos import score_sigma_grid
+
+            out = self.configs.kineidos.sigma_grid_out
+            score_sigma_grid.score(
+                self,
+                step=self.step,
+                arm=self.configs.kineidos.sigma_grid_arm
+                or self.configs.run_name,
+                out_dir=Path(out) if out else Path(self.run_dir) / "sigma_grid",
+                n_noise=int(self.configs.kineidos.sigma_grid_noise),
+                n_windows=int(self.configs.kineidos.sigma_grid_windows),
+            )
+
         if was_training:
             self.raw_model.train()
+
+    def sigma_grid_due(self) -> bool:
+        """Is this one of the rounds the per-sigma grid runs on.
+
+        0 means every round, which is what the key defaulted to before it
+        existed.  Otherwise the grid runs on rounds whose step is at or past
+        the next multiple of the interval -- rounded up from eval_interval,
+        since the grid can only run where a round does, and the last step is
+        always included because run() evaluates there whatever the interval
+        says and that round is the arm's final state.
+        """
+        every = int(self.configs.kineidos.sigma_grid_interval)
+        if every <= 0:
+            return True
+        if self.step >= self.configs.max_steps - 1:
+            return True
+        interval = max(int(self.configs.eval_interval), 1)
+        # The round index, so the test does not depend on whether the step
+        # numbering is 0- or 1-based at this point in the loop.
+        rounds_per_grid = max(int(round(every / interval)), 1)
+        return ((self.step + 1) // interval) % rounds_per_grid == 0
 
     def write_heldout_rows(self, rows: list[dict[str, Any]]) -> None:
         """One line per held-out window, per rank, per evaluation round.
@@ -517,6 +693,14 @@ class KineidosTrainer(AF3Trainer):
         # rank writes here.
         out.mkdir(parents=True, exist_ok=True)
         path = out / f"step_{self.step}.rank{DIST_WRAPPER.rank}.jsonl"
-        with open(path, "w") as handle:
+        # Atomic.  These rows are what P009 section 6.2's verdict is computed
+        # from, and read_heldout.load_rows reads whatever lines are present
+        # with no completeness check -- so a round cut short by a preemption
+        # would read as a complete round over fewer windows.  Today that is
+        # caught only because read_heldout compares window sets across arms
+        # and raises when they differ, which needs at least one arm to have
+        # survived the same preemption.  Writing aside and renaming removes
+        # the condition rather than relying on a sibling.
+        with atomic.atomic_open(path) as handle:
             for row in rows:
                 handle.write(json.dumps(row, sort_keys=True) + "\n")

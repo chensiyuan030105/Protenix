@@ -29,6 +29,7 @@ from configs.configs_model_type import model_configs
 from protenix.config import parse_configs
 from protenix.utils.distributed import DIST_WRAPPER
 
+from kineidos import determinism
 from kineidos.train.trainer import KineidosTrainer, wp_token_dim_for
 
 # Undo protenix/data/pipeline/data_pipeline.py:36, which runs at import and sets
@@ -73,16 +74,18 @@ def deep_update(d, u):
     return d
 
 
-def main() -> None:
-    from protenix.config import parse_sys_args
+def build_configs(arg_str: str):
+    """The two-pass parse, with wp_token_dim placed between the passes.
 
-    logging.basicConfig(
-        format=("%(asctime)s,%(msecs)-3d %(levelname)-8s "
-                "[%(filename)s:%(lineno)s %(funcName)s] %(message)s"),
-        level=logging.INFO,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        filemode="w",
-    )
+    Separate from main() so that a tool which is not the training loop can
+    reach the same configuration by the same route.  P010's
+    kineidos.score_sigma_grid scores a checkpoint with `KineidosTrainer`, and
+    building its config any other way would be a second answer to "what does
+    this arm's architecture look like" -- exactly the gap the constructor check
+    in KineidosTrainer.__init__ exists to catch.
+    """
+    from protenix.config import parse_sys_args  # noqa: F401  (documented route)
+
     # Same environment switches upstream's main() honours.  On a login node
     # both must be "torch": the cuequivariance kernels dlopen libcuda.so.1.
     configs_base["triangle_attention"] = os.environ.get(
@@ -90,7 +93,6 @@ def main() -> None:
     configs_base["triangle_multiplicative"] = os.environ.get(
         "TRIANGLE_MULTIPLICATIVE", "cuequivariance")
 
-    arg_str = parse_sys_args()
     first = parse_configs({**configs_base, **{"data": data_configs}},
                           arg_str=arg_str, fill_required_with_null=True)
     model_name = first.model_name
@@ -106,8 +108,30 @@ def main() -> None:
     if token_dim is not None:
         base["model"]["diffusion_module"]["wp_token_dim"] = token_dim
 
-    configs = parse_configs(configs=base, arg_str=arg_str,
-                            fill_required_with_null=True)
+    return parse_configs(configs=base, arg_str=arg_str,
+                         fill_required_with_null=True)
+
+
+def main() -> None:
+    from protenix.config import parse_sys_args
+
+    logging.basicConfig(
+        format=("%(asctime)s,%(msecs)-3d %(levelname)-8s "
+                "[%(filename)s:%(lineno)s %(funcName)s] %(message)s"),
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        filemode="w",
+    )
+    # Before the model is built and before any data is drawn, because
+    # use_deterministic_algorithms changes which kernels get selected.  Off
+    # unless KINEIDOS_DETERMINISTIC is set; see kineidos/determinism.py for
+    # why the training path needs it too, and for what it cannot promise about
+    # the backward.
+    determinism.enable()
+    configs = build_configs(parse_sys_args())
+    model_name = configs.model_name
+    wp_mode = configs.wp.mode
+    token_dim = configs.model.diffusion_module.get("wp_token_dim", None)
 
     # Seeding is not done here.  AF3Trainer.init_env calls seed_everything
     # (protenix/utils/seed.py:22) immediately before the model is built, and it

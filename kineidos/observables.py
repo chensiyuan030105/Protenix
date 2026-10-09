@@ -89,6 +89,23 @@ def read(model: torch.nn.Module) -> dict[str, float]:
         # and the one part of it that can move is the c_l block: identity at the
         # start, with a real gradient of delta (x) c_l.
         stats["w_cl_drift_from_identity"] = drift
+        # LayerNorm's own scale and shift, which is what the optimizer has
+        # actually been using to switch the injection off: P009 watched gamma's
+        # rms fall from 0.979 to 0.14 over 3150 steps, forty points, monotone,
+        # no plateau.  Recorded here because that number was only ever
+        # recovered by opening a checkpoint afterwards, and P010's gamma-freeze
+        # arms read it per step -- arm B's question is whether gamma starts
+        # falling again within 500 steps of being released (section 6, item 3),
+        # which a per-checkpoint reading cannot answer.
+        #
+        # rms rather than the norm, so the number is comparable across widths
+        # and starts at exactly 1.0 (gamma = ones at initialisation).
+        with torch.no_grad():
+            ln = getattr(enc, "wp_layernorm", None)
+            if ln is not None and getattr(ln, "weight", None) is not None:
+                stats["gamma_rms"] = ln.weight.float().pow(2).mean().sqrt().item()
+            if ln is not None and getattr(ln, "bias", None) is not None:
+                stats["beta_rms"] = ln.bias.float().pow(2).mean().sqrt().item()
     return stats
 
 

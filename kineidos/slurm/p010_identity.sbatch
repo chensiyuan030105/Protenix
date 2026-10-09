@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# P010 section 6, item 5b: the two test branches must be p010-base with their
+# switches off.
+#
+# Nine arms share one set of baselines (D10), and that is only allowed if the
+# oracle and gamma branches reduce to p010-base exactly when their switches are
+# off.  "Exactly" means bit-identical, not "close": each branch adds code to a
+# path every arm runs through, and a change that shifts the RNG stream by one
+# draw -- a projection built from the global generator, an augmentation call
+# skipped -- would make the arms unpaired while leaving every number plausible.
+# That failure has no other detector.
+#
+# All three trees in one job, one after another in the same allocation, then
+# compared.  One allocation rather than three because the comparison is the
+# point and three jobs could land on three different nodes; GPU arithmetic is
+# deterministic on one device for one code path, and across devices it is a
+# claim nobody should have to make.
+#
+#   sbatch --gres=gpu:a100:1 --cpus-per-task=8 --mem=96G --nodes=1 \
+#          --exclude=<busy> \
+#          repos/research/kineidos-v3-diag/kineidos/slurm/p010_identity.sbatch
+#
+# Two steps, not one, and the reason is in kineidos/train/check_trainer.py:
+# af3_lr_scheduler warms up, so the *first* optimizer step runs at lr = 0 and
+# moves nothing.  A one-step run would compare three models that had not
+# changed, which passes without testing the gradient path at all.
+#SBATCH --job-name=p010-identity
+#SBATCH --partition=background
+#SBATCH --account=grad-students
+#SBATCH --nodes=1
+# Excluded, and each name is a measured failure rather than a precaution:
+#   deep-h-1/-2/-3  broken GPUs (nvidia-smi itself cannot get a device handle,
+#                   while slurm happily allocates gres:gpu:1 -- three P009
+#                   jobs ran to completion on CPU before this was noticed)
+#   deep-chungus-7  **GPU 7 is broken** (AGENTS.md's 已知坏卡, 2026-10-07 on):
+#                   nvidia-smi reports a healthy, empty A100 80GB and both the
+#                   visibility and the memory check pass, but the CUDA runtime
+#                   fails to initialise in-process.  P006 measured 12 ns/day
+#                   against a sibling's 173 on the same node, exit code 0, log
+#                   clean; and in one 54-task array, 35 tasks were rejected by
+#                   the startup check and every one of them was on that card.
+#                   A card that fails or crawls stays *idle on slurm's books*,
+#                   so the scheduler keeps feeding it -- a bad card pumps an
+#                   array dry.  --gres cannot name a device, so the node goes.
+#                   Our preflight's third safeguard allocates and multiplies,
+#                   which catches it; excluding the node saves the queue slot.
+#   deep-chungus-8, deep-gpu-10/-11  DOWN+NOT_RESPONDING
+#   deep-chungus-6  IDLE with no GPU at all
+#   deep-chungus-3/-4/-5  our own P006 GROMACS array has their CPUs at load
+#                   38-74, and load tracks step time cleanly (4-6.5 -> 6-7.7
+#                   s/it, 33 -> 14.1)
+# 排除列表，**每一条带日期和判据**（2026-10-09 实测复核）。
+#   deep-h-1/-2/-3   三台 h100 全部 IDLE+DRAIN。h-2 的 GPU 连 nvidia-smi 都拿不到句柄；
+#                    h-3 的卡是好的（7 张 H100 80GB 可见、/dev/nvidia* 齐全、驱动
+#                    610.57.04），但驱动 API 直接 `cuInit(0)` 返回 999，所以也用不了。
+#                    **注意：AGENTS.md 旧版用「ldconfig 里没有 libcuda.so.1」当判据，那是错的**
+#                    —— h-3 上它就在 /usr/lib/x86_64-linux-gnu/，只是不在 ldconfig 缓存里。
+#                    复查判据：在上面跑 `cuInit` 返回 0 就可以把它们删掉。
+#   deep-chungus-6   `Gres=(null)`，**真的一张卡都没有**（上面那些作业是纯 CPU 的）。
+#   deep-chungus-7   GPU 7 坏：nvidia-smi 把它报成健康、显存全空，而 CUDA runtime 在
+#                    进程内起不来。--gres 不能指定设备号，只能排整个节点。
+#   deep-chungus-8   IDLE+DRAIN。它 10-09 凌晨从 DOWN 恢复过，我们在上面跑过两条臂，
+#                    随后又被 drain。**所以这一条是会变的，提交前值得瞄一眼。**
+#   deep-gpu-10/-11  DOWN+NOT_RESPONDING（2080 Ti / V100，本来也不适配 cu126 的构建）。
+#
+# **删掉的（原因已过期，2026-10-09）**：deep-chungus-3/-4/-5。原注释写「我们自己的 P006
+# GROMACS array 把它们的 CPU 压到 load 38-74」—— 那是 10-08 的瞬时状态。10-09 复核：
+# chungus-4 九张卡**只占两张、空七张**，load 20。**一条按当时负载写死的排除，
+# 在集群上会一直挡着一个早就空出来的节点。**负载是用 `--nodelist` 挑的理由，不是 `--exclude` 的。
+#SBATCH --exclude=deep-h-1,deep-h-2,deep-h-3,deep-chungus-6,deep-chungus-7,deep-chungus-8,deep-gpu-10,deep-gpu-11
+#SBATCH --ntasks=1
+#SBATCH --time=03:00:00
+#SBATCH --output=/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace/runs/slurm/%x-%j.out
+#SBATCH --error=/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace/runs/slurm/%x-%j.err
+
+set -euo pipefail
+
+WORKSPACE="/mnt/xfs/home/mhg/Projects/ForSiyuan/Kineidos-Workspace"
+ENV="/mnt/xfs/home/mhg/anaconda3/envs/kineidos-v2-slurm"
+CHECKPOINT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/runtimes/checkpoints/protenix_pretrained/protenix_base_default_v1.0.0.pt"
+
+BASE_TREE="${BASE_TREE:-repos/research/kineidos-v3-diag}"
+TREES="${TREES:-repos/research/kineidos-v3-diag repos/research/kineidos-v3-diag-oracle repos/research/kineidos-v3-diag-gamma}"
+WP_MODE="${WP_MODE:-random}"
+MAX_STEPS="${MAX_STEPS:-2}"
+EVAL_WINDOWS="${EVAL_WINDOWS:-64}"
+SIGMA_NOISE="${SIGMA_NOISE:-4}"
+SEED="${SEED:-42}"
+OUT="${OUT:-${WORKSPACE}/runs/p010/identity}"
+# Job-stamped, and not identity_check.md: that one is section 6 item 5b's
+# hand-written verdict, which cites these tables.  This file is regenerated
+# and overwritten -- the same separation readout.md needed.
+REPORT="${REPORT:-${WORKSPACE}/artifacts/reports/P010/identity_check_job${SLURM_JOB_ID:-none}.md}"
+
+GAGU_ROOT="/mnt/xfs/home/mhg/Projects/ForSiyuan/RNA-WorldParticle-Workspace/datasets/processed/gagu_internal_loop_v0_1"
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-$({ ls -d ${GAGU_ROOT}/*_r[123] 2>/dev/null || true; } | xargs -r -n1 basename | paste -sd,)}"
+HELD_OUT="${HELD_OUT:-$({ ls -d ${GAGU_ROOT}/*_r4 2>/dev/null || true; } | xargs -r -n1 basename | paste -sd,)}"
+# Refuse an empty list rather than passing one on the command line.  The
+# defaults above are `ls | xargs | paste` pipelines, so a renamed or missing
+# GAGU_ROOT makes them the empty string -- the same failure that cost job
+# 2149587 (an empty value does not merely vanish: parse_sys_args builds
+# `f"{k} {v} "` and parse_configs splits it, so the key is left bare and every
+# later --key/value pair shifts by one), but reached from a missing dataset
+# rather than from a hardcoded "".  check_p010's static scan cannot see this
+# one, because there is no "" written anywhere.
+#
+# `:?` because it fires on empty *and* unset, at the point the value is used,
+# without anyone having to remember to scan for it (the idiom is the P006
+# session's).  Printing the count below is not enough: it reports and
+# continues.
+: "${TRAIN_SAMPLES:?no training trajectories matched under ${GAGU_ROOT} -- check the path, do not pass an empty list}"
+: "${HELD_OUT:?no held-out trajectories matched under ${GAGU_ROOT} -- without them evaluate() scores nothing and the arm would train for its whole length and produce no rows}"
+
+mkdir -p "${WORKSPACE}/runs/slurm" "${OUT}" "$(dirname "${REPORT}")"
+cd "${WORKSPACE}"
+
+export PYTHONUNBUFFERED=1
+export LD_LIBRARY_PATH="${ENV}/lib:${LD_LIBRARY_PATH:-}"
+export ATTN_IMPL="${ATTN_IMPL:-sdpa}"
+export LAYERNORM_TYPE="${LAYERNORM_TYPE:-torch}"
+export TRIANGLE_ATTENTION="${TRIANGLE_ATTENTION:-cuequivariance}"
+export TRIANGLE_MULTIPLICATIVE="${TRIANGLE_MULTIPLICATIVE:-cuequivariance}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+# On by default here, and only here.  This job's criterion *is* bit-identity,
+# and with the faster kernels the scoring is not reproducible even against
+# itself: measured envelope 1.478e-04 on loss_edm_weighted (jobs 2149391 /
+# 2149412, same node, same device).  With determinism on, two independent
+# scorings of one arm come out byte-identical over 2816 rows (2149525 /
+# 2149526 compared by 2149583) and torch reports no operation without a
+# deterministic implementation, at no measurable cost -- 3.3 s a window either
+# way.
+#
+# Not on for the arms or the scoring sweeps: their readings sit 400x above
+# that envelope and average over 1024-2048 rows a band, so determinism buys
+# them nothing, while the training backward has more nondeterministic
+# operations to replace than the forward does and the cost there is unmeasured.
+export KINEIDOS_DETERMINISTIC="${KINEIDOS_DETERMINISTIC:-1}"
+if [ "${KINEIDOS_DETERMINISTIC}" = "1" ]; then
+  export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+fi
+
+echo "JOB_ID=${SLURM_JOB_ID:-none} HOST=$(hostname)"
+echo "TREES=${TREES}"
+echo "BASE_TREE=${BASE_TREE} WP_MODE=${WP_MODE} MAX_STEPS=${MAX_STEPS}"
+# The precondition the comparison has no meaning without: each test tree must
+# be the integration tree **plus one layer**, not a cousin of it.
+#
+# Nothing checked this, and it cost two runs of this job.  On 2026-10-08 the
+# oracle and gamma worktrees were 20 commits behind diag -- far enough back
+# that they did not contain kineidos/determinism.py at all, so
+# `determinism.enable()` was a no-op there and the job compared one
+# deterministic run against two nondeterministic ones.  The report said
+# "**差异**" for both branches with max |delta| up to 1.3 on loss_unweighted,
+# 200x the forward-only envelope, every one of them at sigma 24.4 or 45.7 --
+# which reads exactly like "the branches changed the computation" and was
+# entirely my own branch staleness.
+#
+# D10's "共用基线的条件" is that a test branch reduces to p010-base with its
+# switch off.  That cannot be true of a branch which does not contain
+# p010-base.  `merge-base --is-ancestor` is that sentence in one command.
+for TREE in ${TREES}; do
+  [ "${TREE}" = "${BASE_TREE}" ] && continue
+  if ! git -C "${TREE}" merge-base --is-ancestor HEAD "${BASE_TREE}" 2>/dev/null \
+     && ! git -C "${TREE}" merge-base --is-ancestor \
+          "$(git -C "${BASE_TREE}" rev-parse HEAD)" HEAD 2>/dev/null; then
+    BEHIND=$(git -C "${TREE}" rev-list --count \
+             "HEAD..$(git -C "${BASE_TREE}" rev-parse HEAD)" 2>/dev/null || echo "?")
+    echo "拒绝比较：$(basename "${TREE}") 不是 $(basename "${BASE_TREE}") HEAD 的后代" >&2
+    echo "  落后 ${BEHIND} 个 commit。先 rebase：" >&2
+    echo "    git -C ${TREE} rebase --onto $(git -C "${BASE_TREE}" rev-parse --abbrev-ref HEAD) \\" >&2
+    echo "      \$(git -C ${TREE} merge-base $(git -C "${BASE_TREE}" rev-parse --abbrev-ref HEAD) HEAD)" >&2
+    echo "  一个落后的分支和基线之间的任何差异都解释不了——它既可能是开关" >&2
+    echo "  的代码，也可能是它缺的那些 commit。" >&2
+    exit 1
+  fi
+done
+
+NGPU_WANT=1
+# shellcheck source=./p010_preflight.sh
+source "${BASE_TREE}/kineidos/slurm/p010_preflight.sh"
+
+# Defined before the run loop, because the loop uses it to decide what it can
+# skip.  Anchored on the timestamp init_basics appends: a bare prefix would
+# make `...-diag` match `...-diag-oracle`.
+newest () { ls -d "${OUT}"/identity_"$1"_[0-9]*_[0-9]* 2>/dev/null | sort | tail -1; }
+
+for TREE in ${TREES}; do
+  LABEL=$(basename "${TREE}")
+  # Idempotent, and not as an optimisation.  On 2026-10-08 job 2149625 ran all
+  # three trees to completion -- 26 minutes of GPU -- and then died in the
+  # *comparison*.  A rerun has to be able to reach the comparison without
+  # paying for the runs again, or a bug in the reporting costs the measurement.
+  EXISTING=$(newest "${LABEL}")
+  if [ -n "${EXISTING}" ] && [ "${FORCE:-0}" != "1" ] \
+     && ls "${EXISTING}"/heldout/*.jsonl >/dev/null 2>&1 \
+     && ls "${EXISTING}"/sigma_grid/*.jsonl >/dev/null 2>&1; then
+    echo ""
+    echo "=== ${LABEL}: already run ($(basename "${EXISTING}")); FORCE=1 to redo ==="
+    continue
+  fi
+  echo ""
+  echo "=== ${LABEL} ==="
+  # A per-tree base_dir, and no resume_dir at all: resuming one tree's
+  # checkpoint into another is exactly the confound this job looks for, and the
+  # config default for kineidos.resume_dir is already "" -- which disables
+  # resume.
+  #
+  # Omitted rather than passed as "".  An empty value cannot survive the
+  # command line at all: parse_sys_args builds `f"{k} {v} "` and parse_configs
+  # splits that on whitespace, so an empty v leaves the key with nothing after
+  # it *and shifts every later key/value pair by one*.  This cost 33 minutes of
+  # chain latency on 2026-10-08 -- job 2149587 died in ten seconds with
+  # "argument --kineidos.resume_dir: expected one argument", after the 33-minute
+  # acceptance it depended on had already passed, and took four queued arms
+  # with it as DependencyNeverSatisfied.  The hard error was the lucky case.
+  export PYTHONPATH="${TREE}:repos/research/wp-v2"
+  "${ENV}/bin/python" -u -m kineidos.train.main \
+    --wp.mode "${WP_MODE}" \
+    --load_checkpoint_path "${CHECKPOINT}" \
+    --project p010 \
+    --run_name "identity_${LABEL}" \
+    --base_dir "${OUT}" \
+    --max_steps "${MAX_STEPS}" \
+    --seed "${SEED}" \
+    --log_interval 1 \
+    --eval_interval "${MAX_STEPS}" \
+    --checkpoint_interval -1 \
+    --skip_mini_rollout true \
+    --use_wandb false \
+    --skip_confidence true \
+    --skip_distogram true \
+    --loss.weight.alpha_confidence 0.0 \
+    --loss.weight.alpha_distogram 0.0 \
+    --kineidos.train_samples "${TRAIN_SAMPLES}" \
+    --kineidos.num_workers 0 \
+    --kineidos.held_out_samples "${HELD_OUT}" \
+    --kineidos.eval_windows "${EVAL_WINDOWS}" \
+    --kineidos.sigma_grid true \
+    --kineidos.sigma_grid_arm "identity_${LABEL}" \
+    --kineidos.sigma_grid_noise "${SIGMA_NOISE}" \
+    "$@"
+  echo "=== ${LABEL}: done ==="
+done
+
+# ---------------------------------------------------------------- compare
+export PYTHONPATH="${BASE_TREE}:repos/research/wp-v2"
+BASE_LABEL=$(basename "${BASE_TREE}")
+
+BASE_DIR=$(newest "${BASE_LABEL}")
+[ -n "${BASE_DIR}" ] || { echo "no run directory for ${BASE_LABEL}" >&2; exit 1; }
+
+# %x in the --output template is the job name *as submitted*, which the command
+# line can override -- so this is derived from SLURM_JOB_NAME, never spelled
+# out.  Spelling it out is what killed 2149625: the file was
+# p010-acc-identity-2149625.err because --job-name said so.
+LOG="${WORKSPACE}/runs/slurm/${SLURM_JOB_NAME:-p010-identity}-${SLURM_JOB_ID:-none}.err"
+[ -f "${LOG}" ] || echo "note: no ${LOG}, so the train-loss column reads '?'" >&2
+
+{
+  echo "# P010 §6 第 5 条 (b)：恒等检查"
+  echo
+  echo "作业 \`${SLURM_JOB_ID:-none}\`，节点 \`$(hostname)\`，$(date -u '+%Y-%m-%d %H:%MZ')。"
+  echo
+  echo "问的是：两个测试分支在各自的开关关闭时，是不是 \`p010-base\` 本身。"
+  echo "判据是**逐位**，不是「接近」——每个分支都在所有臂都要走的路径上加了代码，"
+  echo "而一个把 RNG 流挪了一个抽样的改动（用全局 generator 造投影、跳过一次增广调用）"
+  echo "会让九个臂不再配对，同时每个数字看起来都正常。这个失败没有别的探测器。"
+  echo
+  echo "两步而不是一步：af3_lr_scheduler 有 warmup，**第一个 optimizer step 的 lr = 0**，"
+  echo "一步跑完三个模型都没动过，检查会通过而根本没测到梯度路径"
+  echo "（见 \`kineidos/train/check_trainer.py\` 第 5 节）。"
+  echo
+  echo "| 树 | 运行目录 | 逐窗口 jsonl | 逐 σ jsonl | step-1 训练 loss |"
+  echo "|---|---|---|---|---|"
+} > "${REPORT}"
+
+FAILED=""
+for TREE in ${TREES}; do
+  LABEL=$(basename "${TREE}")
+  DIR=$(newest "${LABEL}")
+  if [ -z "${DIR}" ]; then
+    echo "| \`${LABEL}\` | — | 缺 | 缺 | 缺 |" >> "${REPORT}"
+    FAILED="${FAILED} ${LABEL}(missing)"
+    continue
+  fi
+  if [ "${LABEL}" = "${BASE_LABEL}" ]; then
+    echo "| \`${LABEL}\` | \`$(basename "${DIR}")\` | 基准 | 基准 | 基准 |" >> "${REPORT}"
+    continue
+  fi
+  HO="ok"; SG="ok"; LO="ok"
+  for f in "${BASE_DIR}"/heldout/*.jsonl; do
+    b=$(basename "$f")
+    cmp -s "$f" "${DIR}/heldout/${b}" || HO="**差异**"
+  done
+  # The per-sigma files carry the arm name, so they differ by name and have to
+  # be matched by step rather than by basename.
+  for f in "${BASE_DIR}"/sigma_grid/*.jsonl; do
+    tailpart="${f##*_step}"
+    g=$(ls "${DIR}"/sigma_grid/*_step"${tailpart}" 2>/dev/null | head -1 || true)
+    if [ -z "$g" ]; then
+      SG="**缺**"
+    else
+      # Byte comparison would trip on the `arm` field alone, which is the tree
+      # name by construction.  --identical reports which metric moved and by
+      # how much, which is the distinction that matters here.
+      "${ENV}/bin/python" -u -m kineidos.read_sigma_grid --identical "$f" "$g" \
+        | tee -a "${REPORT}.log" | grep -q "PASS" || SG="**差异**"
+    fi
+  done
+  # The training-side half.  The eval rows only exercise the forward pass; the
+  # periodic metrics line is where the backward and the optimizer show up.
+  #
+  # Rewritten after it killed job 2149625 -- three faults in one line:
+  #
+  #   * the log path was hardcoded as "p010-identity-", while the file is
+  #     named after %x, the actual job name.  grep on a missing file exits 2,
+  #     pipefail propagated it and `set -e` ended the job -- *after* all three
+  #     trees had run.
+  #   * `head` in a pipe under pipefail is the SIGPIPE hazard AGENTS.md warns
+  #     about.
+  #   * and it said nothing even when it worked: one md5 over four lines of a
+  #     log that interleaves all three trees gives every row the same hash.
+  #
+  # Now it takes the lines belonging to *this* tree -- each log line carries
+  # the tree's own path -- and reports its last train loss, which a reader can
+  # compare.  And every substitution ends in `|| true`: the comparison is this
+  # job's payload, so a cosmetic column must not be able to fail it.
+  a=$( { grep -h "/${LABEL}/runner/train.py" "${LOG}" 2>/dev/null \
+         | grep -oE "'train/loss.avg': np.float64\([0-9.]+" \
+         | awk 'END{print}' | grep -oE "[0-9.]+$" ; } || true )
+  a="${a:-?}"
+  echo "| \`${LABEL}\` | \`$(basename "${DIR}")\` | ${HO} | ${SG} | ${a} |" >> "${REPORT}"
+  case "${HO}${SG}" in *差异*|*缺*) FAILED="${FAILED} ${LABEL}";; esac
+done
+
+{
+  echo
+  if [ -n "${FAILED}" ]; then
+    echo "**不通过：${FAILED}**。按 §6 第 5 条 (b)，该分支自己补跑"
+    echo "\`random-1gpu\` / \`zero-1gpu\`，并在报告里标明；不许跨分支硬比。"
+  else
+    echo "**全部逐位一致。** 九个臂共用 \`p010-base\` 的基线臂（D10）。"
+  fi
+  echo
+  echo "逐 σ 比较的完整输出在 \`$(basename "${REPORT}").log\`。"
+} >> "${REPORT}"
+
+cat "${REPORT}"
+[ -z "${FAILED}" ] || exit 1
+
+# The job that verifies is the job that stamps.  Section 6 item 5a gates
+# p010-base and item 5b gates the other two, and until now the tags were
+# applied by hand after reading this report -- which means a dependency chain
+# that starts the arms on `afterok` would start them before the tags existed,
+# and their env.lock would record a commit with no tag against it.
+#
+# Local only, no push: the arms read local tags, and a job pushing to a remote
+# is a surprise nobody asked for.  Idempotent, because a requeue re-runs this.
+tag_tree () {
+  local tree="$1" tag="$2"
+  if git -C "${tree}" tag --points-at HEAD | grep -qx "${tag}"; then
+    echo "  ${tag} already points at $(git -C "${tree}" rev-parse --short HEAD)"
+    return 0
+  fi
+  if git -C "${tree}" rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+    echo "  refusing to move ${tag}: it exists on another commit"          "($(git -C "${tree}" rev-list -n1 --abbrev-commit "${tag}"))."          "A tag that moves is worse than no tag -- an env.lock citing it"          "would describe whichever commit it pointed at last." >&2
+    return 1
+  fi
+  git -C "${tree}" tag -a "${tag}" -m "P010: ${tag}, stamped by identity check job ${SLURM_JOB_ID:-none}"
+  echo "  ${tag} -> $(git -C "${tree}" rev-parse --short HEAD)"
+}
+
+echo ""
+echo "=== 恒等检查通过，打标签 ==="
+RC=0
+tag_tree "${BASE_TREE}" p010-base || RC=1
+for TREE in ${TREES}; do
+  case "$(basename "${TREE}")" in
+    *-diag-oracle) tag_tree "${TREE}" p010-oracle || RC=1;;
+    *-diag-gamma)  tag_tree "${TREE}" p010-gamma  || RC=1;;
+  esac
+done
+exit "${RC}"
