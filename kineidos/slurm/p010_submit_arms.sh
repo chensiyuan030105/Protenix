@@ -55,6 +55,13 @@ random-1gpu|DIAG|random||
 zero-1gpu|DIAG|zero||
 random-1gpu-seed2|DIAG|random|SEED=43|
 oracle-noaug|ORACLE|oracle||--wp.oracle_source target --wp.target_augmentation false
+# P010 section 8: the linear oracle hands the network a two-dimensional shadow,
+# so its negative gate reads on the encoding and not on the pathway.  These two
+# repeat the gate with an encoding that loses nothing (trilateration
+# reconstruction 4e-15 nm) and carries no frame (invariance 5.7e-14).  Decoy is
+# not optional -- D2 item 6.
+oracle-v2|ORACLE|oracle||--wp.oracle_source target --wp.oracle_encoding fourier_anchor
+oracle-v2-decoy|ORACLE|oracle||--wp.oracle_source decoy --wp.oracle_encoding fourier_anchor
 gamma-freeze-A|GAMMA|random||--wp.freeze_layernorm_until_step 2000
 gamma-freeze-B|GAMMA|random||--wp.freeze_layernorm_until_step 1000
 EOF

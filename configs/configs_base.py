@@ -557,6 +557,24 @@ kineidos_configs = {
         # the network output being in different frames -- which is a real
         # obstacle there and not one at high sigma, where c_skip is small.
         "target_augmentation": True,
+        # P010 section 8.  "linear" is the original probe, h = x_target @ P:
+        # a rank-3 linear map, which wp_layernorm then strips of its scale --
+        # and since the canonical frame's origin sits 5.17 nm from a molecule
+        # 1.47 nm across, the lost radial direction is one fixed global axis,
+        # so the network receives a two-dimensional shadow of the answer
+        # (measured: the perpendicular components come back at R^2 = 0.97, the
+        # parallel one at 0.11).  The gate's registered justification -- "the
+        # target is fully recoverable" -- was computed for P alone and did not
+        # account for the LayerNorm immediately after it.
+        #
+        # "fourier_anchor" is the replacement: each atom's distances to eight
+        # anchor atoms, each distance expanded in 48 log-spaced sine/cosine
+        # features (8 x 48 x 2 = 768).  Invariant by construction, so no frame
+        # has to be inferred; and sin^2 + cos^2 = 1 makes every atom's
+        # LayerNorm normaliser the same constant, so the layer cannot take the
+        # signal.  Default stays "linear" -- changing it would silently change
+        # what every oracle arm means.
+        "oracle_encoding": "linear",
     },
     "kineidos": {
         "gagu_root": (

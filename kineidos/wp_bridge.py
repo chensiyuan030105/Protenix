@@ -44,6 +44,7 @@ MODES = ("none", "zero", "random", "pretrained", "oracle")
 # by a collate being left switched on.
 ORACLE_TARGET_KEY = "wp_oracle_target_nm"
 
+
 # cconv_embedding_dim 384 x factor 2.  factor is 2 rather than 3 because
 # uses_obstacle_features("molecular") is false -- we have no obstacle branch.
 TOKEN_DIM = 768
@@ -51,6 +52,64 @@ TOKEN_DIM = 768
 # Plan section 2.10: 0.35 nm cutoff, which reaches hydrogen bonds (0.28-0.30)
 # and stacking (0.34).  config.yaml's 0.012 gives a 0.054 nm cutoff and leaves
 # every atom isolated.
+
+# P010 section 8.6's replacement encoding.  Eight anchors and 48 frequencies
+# multiply to TOKEN_DIM once sine and cosine are both taken; the assertion
+# below is there because changing either without the other would silently
+# produce a differently shaped h and the fusion's width check would blame the
+# caller.
+ORACLE_ENCODINGS = ("linear", "fourier_anchor")
+ORACLE_K_ANCHOR = 8
+ORACLE_M_FREQ = 48
+# Wavelengths from the molecule's own size down to 0.25 nm.  Not finer: at a
+# 0.05 nm floor the top frequency is 126 rad/nm, so a 0.01 nm displacement
+# turns its phase by 1.26 rad and the channel wraps -- measured, a 0.1 A
+# perturbation moved the LayerNormed encoding by 50%, which is a hash of the
+# conformation rather than a coordinate the network can follow.  At 0.25 nm
+# the response is linear in the displacement over 0.001-0.03 nm (x10 -> x9.93).
+ORACLE_LAMBDA_MAX_NM = 4.0
+ORACLE_LAMBDA_MIN_NM = 0.25
+assert ORACLE_K_ANCHOR * ORACLE_M_FREQ * 2 == TOKEN_DIM
+
+
+def oracle_omega(device=None, dtype=torch.float32) -> torch.Tensor:
+    """The fixed frequency bank, in rad/nm.  Derived from constants rather than
+    stored, so it needs no buffer and no checkpoint entry; `oracle_provenance`
+    reports it so a run is still reproducible from its env.lock."""
+    lam = torch.logspace(math.log10(ORACLE_LAMBDA_MAX_NM),
+                         math.log10(ORACLE_LAMBDA_MIN_NM),
+                         ORACLE_M_FREQ, device=device, dtype=dtype)
+    return 2.0 * math.pi / lam
+
+
+def oracle_anchor_index(n_atom: int, device=None) -> torch.Tensor:
+    """Which atoms serve as distance references.  Spread along the chain and
+    derived from n_atom alone: identical for every window, every arm and every
+    run, so nothing has to be stored or matched at resume."""
+    return torch.linspace(0, n_atom - 1, ORACLE_K_ANCHOR,
+                          device=device).round().long()
+
+
+def oracle_fourier_encode(target: torch.Tensor) -> torch.Tensor:
+    """[N, 3] canonical-frame coordinates in nm -> [N, TOKEN_DIM], frame-free.
+
+    Centred first.  Distances do not care about the offset, but `cdist` does:
+    its default compute_mode expands |a-b|^2 as |a|^2 + |b|^2 - 2 a.b, and the
+    canonical frame puts the molecule 5.17 nm from the origin, so those
+    squared norms are ~27 while their difference is ~1.  Measured in float64
+    before centring, the rotation+translation invariance held only to 3e-05;
+    after centring and with the multiply-free mode, 5.7e-14.  float32 would
+    have been far worse, and the symptom -- an oracle that is almost but not
+    quite frame-free -- is one nobody would have gone looking for.
+    """
+    centred = target - target.mean(dim=0, keepdim=True)
+    idx = oracle_anchor_index(target.shape[0], device=target.device)
+    dist = torch.cdist(centred, centred[idx],
+                       compute_mode="donot_use_mm_for_euclid_dist")
+    phase = dist[..., None] * oracle_omega(target.device, target.dtype)
+    return torch.cat([phase.sin(), phase.cos()],
+                     dim=-1).reshape(target.shape[0], TOKEN_DIM)
+
 PARTICLE_RADIUS_NM = 0.0778
 
 # config.yaml, except particle_radius and other_feats_channels.
@@ -144,6 +203,7 @@ class WorldParticleBridge(nn.Module):
         seed: Optional[int] = None,
         oracle_source: str = "",
         oracle_seed: int = 20261008,
+        oracle_encoding: str = "linear",
     ) -> None:
         super().__init__()
         if mode not in MODES:
@@ -154,6 +214,13 @@ class WorldParticleBridge(nn.Module):
         self.time_channels = int(time_channels)
         self.wp = None
         self.oracle_seed: Optional[int] = None
+
+        self.oracle_encoding = str(oracle_encoding)
+        if self.oracle_encoding not in ORACLE_ENCODINGS:
+            raise ValueError(
+                f"oracle_encoding must be one of {ORACLE_ENCODINGS}, got "
+                f"{self.oracle_encoding!r}"
+            )
 
         if mode == "oracle":
             from kineidos.data import windows
@@ -243,6 +310,10 @@ class WorldParticleBridge(nn.Module):
         return {
             "oracle_source": windows.oracle_source(),
             "oracle_seed": self.oracle_seed,
+            "oracle_encoding": self.oracle_encoding,
+            "oracle_k_anchor": ORACLE_K_ANCHOR,
+            "oracle_m_freq": ORACLE_M_FREQ,
+            "oracle_lambda_nm": [ORACLE_LAMBDA_MAX_NM, ORACLE_LAMBDA_MIN_NM],
             "oracle_projection_shape": list(p.shape),
             "oracle_projection_sha256": hashlib.sha256(
                 p.numpy().tobytes()).hexdigest(),
@@ -366,6 +437,14 @@ class WorldParticleBridge(nn.Module):
                     f"window has {n_atom} atoms; these are the same atom set "
                     f"in the same order or the projection is nonsense"
                 )
+            if self.oracle_encoding == "fourier_anchor":
+                # Same autocast discipline as the linear path below, and for
+                # the same reason: the bridge runs under autocast(bfloat16)
+                # while sample_diffusion_training consumes h with autocast
+                # off, so h has to leave here as float32.
+                with torch.autocast(device_type=position.device.type,
+                                    enabled=False):
+                    return oracle_fourier_encode(target.float())
             # h = x_target_canonical @ P, before wp_layernorm -- which is where
             # the real path hands over too, so the two differ in what h is and
             # in nothing else downstream.
