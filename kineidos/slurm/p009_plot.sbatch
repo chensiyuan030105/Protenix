@@ -33,6 +33,10 @@ export LAYERNORM_TYPE=torch
 export ATTN_IMPL=sdpa
 export LD_LIBRARY_PATH="${ENV}/lib:${LD_LIBRARY_PATH:-}"
 export MPLBACKEND=Agg
+# The tree lives on NFS and this module gets edited between runs; a stale
+# kineidos/__pycache__/*.pyc on the compute node silently ran the previous
+# version once (2026-10-08).  Analysis jobs are short, so don't cache.
+export PYTHONDONTWRITEBYTECODE=1
 
 echo "host $(hostname)  started $(date -Is)"
 git -C repos/research/kineidos-v3 rev-parse --short HEAD
@@ -43,3 +47,11 @@ git -C repos/research/kineidos-v3 rev-parse --short HEAD
   --verify artifacts/reports/P009/readout.md
 
 echo "done $(date -Is)"
+
+# the same three arguments as a 16:9 strip, for the one-page report frame
+"${ENV}/bin/python" -m kineidos.plot_heldout --layout report \
+  --out artifacts/reports/P009/p009_loss_report.png \
+  --json artifacts/reports/P009/p009_loss_curves.json \
+  --verify artifacts/reports/P009/readout.md
+
+echo "report done $(date -Is)"

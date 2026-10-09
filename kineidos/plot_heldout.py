@@ -340,8 +340,137 @@ def draw(curves, trains, bins, step, stops, out_png):
     return out_png
 
 
+def draw_report(curves, trains, bins, step, stops, out_png):
+    """The same three arguments, laid out as a 16:9 strip for the one-pager.
+
+    Same numbers, same colours, same verified source -- only the arrangement
+    differs, because a board frame wants a wide strip and a reading figure
+    wants a tall stack.  The Chinese commentary lives in the Figma frame, so
+    this version carries less text than the stacked one.
+    """
+    plt.rcParams.update({
+        "font.size": 11, "axes.edgecolor": GRID, "axes.labelcolor": BODY,
+        "xtick.color": MUTE, "ytick.color": MUTE, "axes.titlecolor": INK,
+    })
+    # The strip is the centrepiece of a 16:9 board frame, so it is tall enough
+    # to carry the page.  Margins are given in inches and converted, so the
+    # header and footer keep their size when the height changes.
+    FW, FH = 18.4, 5.5
+    HEADER, FOOTER = 0.80, 1.00          # inches reserved above / below the axes
+    fig = plt.figure(figsize=(FW, FH))
+    fig.patch.set_facecolor(SURFACE)
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.55, 1.0, 1.0], wspace=0.205,
+                          left=0.050, right=0.992,
+                          top=1 - HEADER / FH, bottom=FOOTER / FH)
+    ax1, ax2, ax3 = (fig.add_subplot(g) for g in gs)
+    for ax in (ax1, ax2, ax3):
+        ax.set_facecolor("#ffffff")
+        ax.grid(True, color=GRID, lw=0.9, zorder=0)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+
+    xmax = max(max(c) for c in curves.values())
+    lo, hi = [], []
+    for arm in ORDER:
+        st = STYLE[arm]
+        tr = trains.get(arm, [])
+        if tr:
+            ts = np.array([q[0] for q in tr]); tv = np.array([q[1] for q in tr])
+            k = 4
+            sm = np.convolve(tv, np.ones(k) / k, mode="valid"); ts = ts[k - 1:]
+            ax1.plot(ts, sm, color=st["color"], ls=st["ls"], lw=1.0, alpha=0.28, zorder=2)
+            vis = sm[ts >= XMIN]
+            if vis.size:
+                lo.append(vis.min()); hi.append(vis.max())
+        s = sorted(curves[arm]); v = [curves[arm][q] for q in s]
+        ax1.plot(s, v, color=st["color"], ls=st["ls"], lw=2.2, marker="o", ms=6,
+                 mfc="white", mew=1.8, zorder=5)
+        ax1.annotate(arm, xy=(s[-1], v[-1]), xytext=(9, LABEL_DY[arm]),
+                     textcoords="offset points", color=st["color"], fontsize=11,
+                     va="center", fontweight="bold")
+        lo.append(min(v)); hi.append(max(v))
+    pad = 0.055 * (max(hi) - min(lo))
+    ax1.set_ylim(min(lo) - pad, max(hi) + pad)
+    ax1.set_xlim(XMIN, xmax * 1.11)
+    ax1.axvline(step, color=FAINT, lw=1.2, ls=(0, (4, 3)), zorder=1)
+    ax1.text(step - xmax * 0.008, 0.035, f"the read  (step {step})",
+             transform=ax1.get_xaxis_transform(), ha="right", fontsize=10.5,
+             color=MUTE, style="italic")
+    ax1.set_ylabel("held-out total loss")
+    ax1.set_xlabel("optimizer step")
+    ax1.set_title("held-out loss, four arms", loc="left", fontsize=13,
+                  fontweight="bold", pad=10)
+
+    shared = sorted(set(curves["random"]) & set(curves["zero"]) & set(curves["zero-seed2"]))
+    eff = np.array([curves["random"][s] - curves["zero"][s] for s in shared])
+    flo = np.array([abs(curves["zero"][s] - curves["zero-seed2"][s]) for s in shared])
+    ax2.fill_between(shared, -flo, flo, color=BLUE, alpha=0.18, lw=0, zorder=1)
+    ax2.axhline(0, color=FAINT, lw=1.1, zorder=2)
+    ax2.plot(shared, eff, color=ORANGE, lw=2.2, marker="o", ms=6, mfc="white",
+             mew=1.8, zorder=5)
+    ax2.axvline(step, color=FAINT, lw=1.2, ls=(0, (4, 3)), zorder=1)
+    ax2.set_ylim(min(-flo.max(), eff.min()) * 1.52, max(flo.max(), eff.max()) * 1.52)
+    ax2.set_xlim(XMIN, shared[-1] * 1.06)
+    ax2.set_xlabel("optimizer step")
+    ax2.set_title("the effect never leaves the floor", loc="left", fontsize=13,
+                  fontweight="bold", pad=10)
+    ax2.legend(handles=[
+        Line2D([], [], color=ORANGE, lw=2.2, marker="o", ms=6, mfc="white", mew=1.8,
+               label="random − zero"),
+        Patch(facecolor=BLUE, alpha=0.18, label="± |zero − zero-seed2|  (floor)"),
+    ], loc="upper left", frameon=False, fontsize=10.5, ncol=1, labelspacing=0.35)
+
+    x = np.arange(len(bins)); w = 0.32
+    ef = [abs(b["effect_pct"]) for b in bins]; efs = [b["effect_se_pct"] for b in bins]
+    fl = [b["floor_pct"] for b in bins];      fls = [b["floor_se_pct"] for b in bins]
+    ax3.bar(x - w / 2, ef, w, color=ORANGE, yerr=efs, capsize=4,
+            error_kw=dict(ecolor=BODY, lw=1.4), zorder=3, label="| random − zero |")
+    ax3.bar(x + w / 2, fl, w, color=BLUE, yerr=fls, capsize=4,
+            error_kw=dict(ecolor=BODY, lw=1.4), zorder=3, label="the floor")
+    ax3.axhline(0, color=FAINT, lw=1.1, zorder=2)
+    for i, b in enumerate(bins):
+        ax3.annotate(f"{b['effect_pct']:+.2f}%\n|t| = {b['t']:.1f}",
+                     xy=(i - w / 2, ef[i] + efs[i]), xytext=(0, 7),
+                     textcoords="offset points", ha="center", fontsize=10,
+                     color=BODY, fontweight="bold", linespacing=1.4)
+    top = max(e + s for e, s in zip(ef + fl, efs + fls))
+    bot = min(0.0, min(e - s for e, s in zip(ef + fl, efs + fls)))
+    ax3.set_ylim(bot - 0.06 * (top - bot), top + 0.62 * (top - bot))
+    ax3.set_xticks(x)
+    ax3.set_xticklabels([f"{b['bin']} · stride {b['stride']}\n"
+                         f"n = {b['n']} · info ≈ {b['info']:.0%}" for b in bins],
+                        fontsize=9.5, color=BODY, linespacing=1.6)
+    ax3.tick_params(axis="x", length=0, pad=8)
+    ax3.set_xlim(-0.6, len(bins) - 0.4)
+    ax3.set_ylabel("% of that bin's zero-arm loss")
+    ax3.set_title(f"at the read: flat across the bins", loc="left", fontsize=13,
+                  fontweight="bold", pad=10)
+    ax3.legend(loc="upper right", frameon=False, fontsize=10.5, labelspacing=0.35)
+
+    handles = [Line2D([], [], color=STYLE[a]["color"], ls=STYLE[a]["ls"], lw=2.2,
+                      marker="o", ms=6, mfc="white", mew=1.8, label=STYLE[a]["label"])
+               for a in ORDER]
+    handles.append(Line2D([], [], color=MUTE, lw=1.0, alpha=0.4,
+                          label="train loss, 200-step mean"))
+    fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.048, 1 - 0.085 / FH),
+               frameon=False, fontsize=11, ncol=5, columnspacing=2.0,
+               handletextpad=0.6)
+    fig.text(0.050, 0.150 / FH,
+             "256 paired windows · eval_seed 1234 identical in all four arms · "
+             "loaded by kineidos.read_heldout, the loader the registered read of §6.2 uses · "
+             "asserted against artifacts/reports/P009/readout.md before drawing",
+             fontsize=9.5, color=FAINT)
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=200, facecolor=fig.get_facecolor())
+    return out_png
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--layout", choices=("stack", "report"), default="stack",
+                   help="stack: three panels for reading; report: a 16:9 strip")
     p.add_argument("--runs", default="runs/p009")
     p.add_argument("--slurm", default="runs/slurm")
     p.add_argument("--step", type=int, default=None,
@@ -400,7 +529,8 @@ def main() -> int:
         curves={k: {str(s): v for s, v in c.items()} for k, c in curves.items()},
         train={k: v for k, v in trains.items()}, bins=bins, stops=stops,
     ), indent=1, ensure_ascii=False))
-    out = draw(curves, trains, bins, step, stops, Path(a.out))
+    renderer = draw_report if a.layout == "report" else draw
+    out = renderer(curves, trains, bins, step, stops, Path(a.out))
     print(f"  wrote {out}\n  wrote {a.json}")
     return 0
 
