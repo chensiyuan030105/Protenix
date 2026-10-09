@@ -72,6 +72,22 @@ class KineidosTrainer(AF3Trainer):
                 f"sets it before parse_configs; setting it afterwards is too "
                 f"late to reach the constructor."
             )
+        # P011 D4, the same shape of refusal for the same reason.  A config
+        # where kineidos.dt_conditioning is true but the architecture has no
+        # pathway would train the ablation arm under the main arm's name and
+        # look entirely normal in the log -- the pathway contributes exactly
+        # 0.0 at step 0 either way, so nothing in the first thousand steps
+        # would distinguish them.
+        want_dt = bool(configs.kineidos.dt_conditioning)
+        got_dt = bool(configs.model.diffusion_module.get("dt_conditioning",
+                                                         False))
+        if got_dt != want_dt:
+            raise ValueError(
+                f"kineidos.dt_conditioning={want_dt!r} needs "
+                f"model.diffusion_module.dt_conditioning={want_dt!r}, but the "
+                f"parsed config has {got_dt!r}. Launch through "
+                f"kineidos.train.main, which sets it before parse_configs."
+            )
         super().__init__(configs)
 
     # -------------------------------------------------------------- log

@@ -608,6 +608,25 @@ kineidos_configs = {
         # The trained checkpoint kineidos.score_sigma_grid scores.  Only that
         # entry point reads it; a training run leaves it empty.
         "score_checkpoint": "",
+        # Kineidos P011 D4: condition the diffusion head on log10(dt).
+        #
+        # True by default, and that asymmetry with every other Kineidos switch
+        # is deliberate.  The others default to off so that a run which does
+        # not ask for them reproduces P009/P010 exactly; this one is not a
+        # diagnostic but a missing input.  P009 established that the model has
+        # never been told the time gap it is asked to predict across -- the
+        # frame-time channel the bridge sends is normalised by the window's own
+        # span, which divides the stride out -- and P007's variable-step
+        # rollout cannot be built without it.  So the pathway is the intended
+        # architecture from here on, and `wp-inv-nodt` passing false is the
+        # ablation.
+        #
+        # It reaches DiffusionModule's constructor the same way wp_token_dim
+        # does, through kineidos/train/main.py's two-pass parse: the module is
+        # built as DiffusionModule(**configs.model.diffusion_module), so a key
+        # set after parse_configs would be too late and would fail by building
+        # the wrong architecture under the right arm's name.
+        "dt_conditioning": True,
         # Resume across a code change.  False refuses, which is the default:
         # see KineidosTrainer.check_resume_provenance.  A config key rather
         # than an environment variable, so that using it is recorded in the

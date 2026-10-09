@@ -47,6 +47,9 @@ class DiffusionConditioning(nn.Module):
         c_s: int = 384,
         c_s_inputs: int = 449,
         c_noise_embedding: int = 256,
+        # Kineidos P011 D4.  False keeps this module byte-identical to
+        # upstream, parameters included.
+        dt_conditioning: bool = False,
     ) -> None:
         super(DiffusionConditioning, self).__init__()
         self.sigma_data = sigma_data
@@ -81,7 +84,90 @@ class DiffusionConditioning(nn.Module):
         # Line10-Line12
         self.transition_s1 = Transition(c_in=self.c_s, n=2)
         self.transition_s2 = Transition(c_in=self.c_s, n=2)
+
+        # ---------------- Kineidos P011 D4: the dt pathway ----------------
+        # The model is asked to predict the structure dt later, and P009
+        # established that it has never been told dt: `delta_t_ns` stops at the
+        # collate's `basic` dict, no module under protenix/model/ reads it, and
+        # `dt_fourier|dt_linear|dt_layernorm` had zero hits across all six
+        # trees.  P004 2.8 designed this and it was never built.  The frame-time
+        # channel the bridge does send is normalised by the window's own span,
+        # which divides the stride out, so it cannot stand in.
+        #
+        # Deliberately the same three pieces, in the same order, as the noise
+        # level immediately above -- FourierEmbedding -> LayerNorm ->
+        # LinearNoBias, added to `single_s`.  STAR-MD conditions on
+        # log10(dt) through AdaLN-Zero; this is the same idea at the one place
+        # Protenix already has for "a scalar the whole diffusion head should
+        # know".
+        #
+        # `initializer="zeros"` is what makes it inert at step 0, the same
+        # AdaLN-Zero trick AdaptiveLayerNorm uses (primitives.py:117-120).
+        # D16's weight_decay=0 matters here: at 1e-8 the optimiser would have
+        # been shrinking a parameter whose gradient is zero, which is how P010
+        # found the fusion's gate being destroyed by the optimiser rather than
+        # by the data.
+        self.dt_conditioning = bool(dt_conditioning)
+        if self.dt_conditioning:
+            # **The global RNG is restored afterwards, on purpose.**
+            # nn.Linear.__init__ calls reset_parameters() before our
+            # `initializer="zeros"` overwrites the weight, so building these
+            # three modules consumes draws from the global generator and shifts
+            # every later draw.  The dt ablation (`wp-inv` against
+            # `wp-inv-nodt`) is only interpretable if the two arms differ in
+            # the pathway and nothing else: without this, they would also get
+            # different fusion and bridge initialisations, and since the
+            # expected dt effect is *below* the seed floor (D4), that
+            # difference would be most of what the ablation measured.
+            # FourierEmbedding needs no such care -- it draws from its own
+            # torch.Generator (embedders.py:229).  CPU state only, which is the
+            # right one: modules are constructed on CPU and moved afterwards.
+            _rng_state = torch.get_rng_state()
+            # A different seed from the noise path's default 42, so that dt and
+            # the noise level do not get the identical random projection.  They
+            # take different inputs, so sharing would not be a bug, but two
+            # pathways that are literally the same function of their argument
+            # is a coincidence waiting to be mistaken for a finding.
+            self.dt_fourier = FourierEmbedding(c=c_noise_embedding, seed=1011)
+            self.dt_layernorm = LayerNorm(c_noise_embedding, create_offset=False)
+            self.dt_linear = LinearNoBias(
+                in_features=c_noise_embedding,
+                out_features=self.c_s,
+                precision=torch.float32,
+                initializer="zeros",
+            )
+            torch.set_rng_state(_rng_state)
+
         print(f"Diffusion Module has {self.sigma_data}")
+
+    def dt_embedding(self, delta_t_ns: torch.Tensor) -> torch.Tensor:
+        """`log10(dt / 1 ns)` -> `[c_s]`, to be broadcast onto `single_s`.
+
+        Returns a 1-d tensor so it broadcasts over both N_sample and N_token
+        without the caller having to know how many leading batch axes there
+        are.
+
+        log10, not dt: P009 2.3 pinned the range to [0.1, 1] ns, over which a
+        linear scale would hand the Fourier features a 10x spread while
+        log10 hands them [-1, 0].  It is also STAR-MD's parameterisation
+        (LogUniform[1e-2, 1e1] ns), so the two stay comparable.
+        """
+        dt = delta_t_ns
+        if not torch.is_tensor(dt):
+            dt = torch.tensor(float(dt))
+        dt = dt.to(device=self.dt_linear.weight.device).float().reshape(-1)
+        if dt.numel() != 1:
+            raise ValueError(
+                f"delta_t_ns must be one value per batch, got {dt.numel()}; "
+                f"batch size is 1 by construction here (the loss calls "
+                f"resolution.item())"
+            )
+        if not bool((dt > 0).all()):
+            raise ValueError(
+                f"delta_t_ns must be positive to take log10, got {float(dt)}"
+            )
+        log10_dt = torch.log10(dt).reshape(())
+        return self.dt_linear(self.dt_layernorm(self.dt_fourier(log10_dt)))
 
     def prepare_cache(
         self,
@@ -116,11 +202,16 @@ class DiffusionConditioning(nn.Module):
         pair_z: torch.Tensor,
         inplace_safe: bool = False,
         use_conditioning: bool = True,
+        delta_t_ns: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             t_hat_noise_level (torch.Tensor): the noise level
                 [..., N_sample]
+            delta_t_ns (torch.Tensor): Kineidos P011 D4, the physical time gap
+                this prediction spans, in ns.  None skips the pathway, which
+                is what makes the step-0 identity check possible on a single
+                model instance rather than on two differently-seeded ones.
             asym_id (torch.Tensor): asym_id
             residue_index (torch.Tensor): residue_index
             entity_id (torch.Tensor): entity_id
@@ -168,6 +259,17 @@ class DiffusionConditioning(nn.Module):
         ).unsqueeze(
             dim=-2
         )  # [..., N_sample, N_tokens, c_s]
+        # P011 D4.  Added to the same `single_s`, after the noise level and
+        # before the transitions, so dt reaches every block the noise level
+        # reaches.  `dt_linear` is zero-initialised, so at step 0 this adds
+        # exactly 0.0 and the sum is bit-identical to not adding it --
+        # kineidos/check_dt_conditioning.py measures that, and measures that a
+        # non-zero dt_linear does change the output, because an identity check
+        # alone is satisfied by a pathway that is wired to nothing at all.
+        if self.dt_conditioning and delta_t_ns is not None:
+            single_s = single_s + self.dt_embedding(delta_t_ns).to(
+                single_s.dtype
+            )
         if inplace_safe:
             single_s += self.transition_s1(single_s)
             single_s += self.transition_s2(single_s)
@@ -273,6 +375,8 @@ class DiffusionModule(nn.Module):
         # Kineidos: width of WorldParticle's per-particle tokens, or None to
         # keep this module byte-identical to upstream.
         wp_token_dim: Optional[int] = None,
+        # Kineidos P011 D4: condition the diffusion head on log10(dt).
+        dt_conditioning: bool = False,
     ) -> None:
         super(DiffusionModule, self).__init__()
         self.sigma_data = sigma_data
@@ -287,8 +391,10 @@ class DiffusionModule(nn.Module):
         self.blocks_per_ckpt = blocks_per_ckpt
         self.use_fine_grained_checkpoint = use_fine_grained_checkpoint
 
+        self.dt_conditioning = bool(dt_conditioning)
         self.diffusion_conditioning = DiffusionConditioning(
-            sigma_data=self.sigma_data, c_z=c_z, c_s=c_s, c_s_inputs=c_s_inputs
+            sigma_data=self.sigma_data, c_z=c_z, c_s=c_s, c_s_inputs=c_s_inputs,
+            dt_conditioning=self.dt_conditioning,
         )
         self.atom_attention_encoder = AtomAttentionEncoder(
             **atom_encoder,
@@ -397,6 +503,13 @@ class DiffusionModule(nn.Module):
                 pair_z,
                 inplace_safe,
                 use_conditioning,
+                # Positional, so this has to track DiffusionConditioning.forward's
+                # order -- the same trap `wp_tokens` carries a note about a few
+                # dozen lines below.  Omitting it here and not in the `else`
+                # branch would give a run whose dt pathway was live only when
+                # gradient checkpointing happened to be off, i.e. live in eval
+                # and dead in training, which is both wrong and invisible.
+                input_feature_dict.get("delta_t_ns", None),
             )
         else:
             s_single, z_pair = self.diffusion_conditioning(
@@ -408,6 +521,14 @@ class DiffusionModule(nn.Module):
                 pair_z=pair_z,
                 inplace_safe=inplace_safe,
                 use_conditioning=use_conditioning,
+                # P011 D4.  `.get`, not `[...]`: dt rides in the feature dict
+                # like `wp_tokens` does, and a caller that does not put it
+                # there (check_fusion, inference on a structure with no
+                # trajectory) gets the pathway skipped rather than a KeyError.
+                # KineidosTrainer refuses a config where the arm wants the
+                # pathway and the batch has no dt, so "skipped" cannot happen
+                # silently in a training run.
+                delta_t_ns=input_feature_dict.get("delta_t_ns", None),
             )  # [..., N_sample, N_token, c_s], [..., N_token, N_token, c_z]
 
         # Expand embeddings to match N_sample

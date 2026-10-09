@@ -97,6 +97,7 @@ def build_configs(arg_str: str):
                           arg_str=arg_str, fill_required_with_null=True)
     model_name = first.model_name
     wp_mode = first.wp.mode
+    dt_conditioning = bool(first.kineidos.dt_conditioning)
 
     base = {**configs_base, **{"data": data_configs}}
     deep_update(base, model_configs[model_name])
@@ -107,6 +108,14 @@ def build_configs(arg_str: str):
     token_dim = wp_token_dim_for(wp_mode)
     if token_dim is not None:
         base["model"]["diffusion_module"]["wp_token_dim"] = token_dim
+
+    # P011 D4, by the same route and for the same reason.  Set only when true,
+    # so that `--kineidos.dt_conditioning false` leaves DiffusionModule's
+    # signature untouched and the module byte-identical to upstream -- the key
+    # being absent and the key being False must not be two different
+    # architectures.
+    if dt_conditioning:
+        base["model"]["diffusion_module"]["dt_conditioning"] = True
 
     return parse_configs(configs=base, arg_str=arg_str,
                          fill_required_with_null=True)
@@ -152,9 +161,18 @@ def main() -> None:
             f"on 2026-10-07. Something re-set it after kineidos.train.main's "
             f"module level -- find it rather than removing this check."
         )
+    # Printed, because P010 16.1's operational conclusion is that a switch
+    # passed through a shell variable has to be confirmed in the log rather
+    # than assumed: `--wp.oracle_shared_rotation true` once arrived as a single
+    # argument because zsh does not word-split an unquoted $X, took no effect,
+    # and cost a whole arm.  The absence of a line like this is what let that
+    # run two minutes instead of being caught at readout.
     logging.info(
         f"model={model_name} wp.mode={wp_mode} "
-        f"wp_token_dim={token_dim} cycle={configs.model.N_cycle} "
+        f"wp_token_dim={token_dim} "
+        f"dt_conditioning={configs.model.diffusion_module.get('dt_conditioning', False)} "
+        f"(config says {configs.kineidos.dt_conditioning}) "
+        f"cycle={configs.model.N_cycle} "
         f"sharing={strategy} "
         f"rank={DIST_WRAPPER.rank}/{DIST_WRAPPER.world_size}"
     )
