@@ -191,8 +191,15 @@ class KineidosTrainer(AF3Trainer):
         # So sample_diffusion_training can reuse the rotation the bridge drew.
         # A reference, not a copy: the bridge rewrites last_rotation on every
         # forward and the generator must see the current one.
+        # A one-element list, not the module.  nn.Module.__setattr__
+        # registers an nn.Module value as a child, which put the bridge's
+        # buffers into diffusion_module's state_dict and made the pretrained
+        # checkpoint fail to load (job 2150503, caught by load_checkpoint's
+        # expect_new guard -- strict=False would have hidden it).  A list is
+        # not an nn.Module, so __setattr__ leaves it alone.  Still a
+        # reference and not a copy: last_rotation is rewritten every forward.
         self.raw_model.diffusion_module.wp_bridge_ref = (
-            bridge if cfg.oracle_shared_rotation else None)
+            [bridge] if cfg.oracle_shared_rotation else None)
         if cfg.oracle_shared_rotation:
             self.print("shared rotation: ON — the bridge draws one rotation "
                        "per forward and the target frame reuses it")

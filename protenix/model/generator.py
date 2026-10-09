@@ -378,7 +378,7 @@ def sample_diffusion_training(
     # the same reason centre_only keeps it: it consumes the RNG the other arms
     # consume, so the noise levels below stay paired.
     _ref = getattr(denoise_net, "wp_bridge_ref", None)
-    _shared = getattr(_ref, "last_rotation", None) if _ref is not None else None
+    _shared = _ref[0].last_rotation if _ref else None
     if _shared is not None:
         _x = label_dict["coordinate"]
         _m = label_dict["coordinate_mask"]
