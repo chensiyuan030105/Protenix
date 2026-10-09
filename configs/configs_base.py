@@ -575,6 +575,14 @@ kineidos_configs = {
         # signal.  Default stays "linear" -- changing it would silently change
         # what every oracle arm means.
         "oracle_encoding": "linear",
+        # readout.md section 13.5.  Permute the finished encoding along the
+        # atom axis, with a fixed seed.  Everything about the injected signal
+        # survives -- its marginal distribution, its magnitude, its rank, how
+        # wp_layernorm treats it -- except which atom each row describes.  It
+        # is the null that `zero` and `random` cannot be, because both of those
+        # have no per-atom structure at all while the open question is whether
+        # per-atom structure suffices without being correct.
+        "oracle_shuffle": False,
     },
     "kineidos": {
         "gagu_root": (

@@ -108,5 +108,41 @@ rmsd = float((rec - c).pow(2).sum(-1).mean().sqrt())
 print()
 check("v2 的锚距可完全重建结构（信息没丢）", rmsd < 1e-5, f"RMSD {rmsd:.3e} nm")
 
+
+# --------------------------------------------------------------------------
+# readout.md 13.5: the shuffle control must keep everything about the injected
+# signal except which atom each row describes.  Both halves are asserted,
+# because a shuffle that also changed the distribution would be a different
+# experiment and a shuffle that changed nothing would be no experiment.
+# --------------------------------------------------------------------------
+from kineidos.wp_bridge import oracle_shuffle_index  # noqa: E402
+
+print("\n=== oracle_shuffle=True：边缘分布要保住，对应要摧毁 ===")
+b_plain = WorldParticleBridge("oracle", oracle_source="target",
+                              oracle_encoding="fourier_anchor")
+b_shuf = WorldParticleBridge("oracle", oracle_source="target",
+                             oracle_encoding="fourier_anchor",
+                             oracle_shuffle=True)
+h_p, h_s = h_of(b_plain, X), h_of(b_shuf, X)
+
+check("shuffle 保住逐元素的边缘分布",
+      bool(torch.allclose(h_p.flatten().sort().values,
+                          h_s.flatten().sort().values, atol=1e-6)),
+      "排序后逐元素相同")
+check("shuffle 保住每个原子的范数集合",
+      bool(torch.allclose(h_p.norm(dim=-1).sort().values,
+                          h_s.norm(dim=-1).sort().values, atol=1e-5)),
+      f"范数 rms {float(h_p.norm(dim=-1).mean()):.4f}（两者同）")
+check("shuffle 摧毁了原子↔几何的对应",
+      float((h_p - h_s).abs().max()) > 1e-2,
+      f"逐位最大差 {float((h_p - h_s).abs().max()):.3e}")
+idx = oracle_shuffle_index(N, 20261008)
+check("shuffle 就是一个置换（可完全还原）",
+      bool(torch.allclose(h_s[idx.argsort()], h_p, atol=1e-6)),
+      "逆置换后与未 shuffle 的逐位相同")
+check("shuffle 确实打乱（不是恒等）",
+      int((idx != torch.arange(N)).sum()) > N * 0.9,
+      f"{int((idx != torch.arange(N)).sum())}/{N} 个原子换了位置")
+
 print("\n全部通过" if not fails else f"\n未通过：{fails}")
 sys.exit(1 if fails else 0)

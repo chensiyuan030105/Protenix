@@ -179,6 +179,7 @@ class KineidosTrainer(AF3Trainer):
             oracle_source=cfg.oracle_source,
             oracle_seed=cfg.oracle_seed,
             oracle_encoding=cfg.oracle_encoding,
+            oracle_shuffle=cfg.oracle_shuffle,
         )
         self.raw_model.wp_bridge = bridge.to(self.device)
         # P010 D-a.  Read by sample_diffusion_training off the denoise net,

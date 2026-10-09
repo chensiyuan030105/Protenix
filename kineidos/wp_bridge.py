@@ -90,6 +90,18 @@ def oracle_anchor_index(n_atom: int, device=None) -> torch.Tensor:
                           device=device).round().long()
 
 
+def oracle_shuffle_index(n_atom: int, seed: int, device=None) -> torch.Tensor:
+    """A fixed permutation of the atom axis, from its own Generator.
+
+    Own Generator for the same reason `oracle_projection` has one: drawing from
+    the global stream would shift the diffusion noise and the augmentation
+    rotations, and the shuffle arm would stop being paired with its siblings
+    for a reason unrelated to the shuffle.
+    """
+    gen = torch.Generator().manual_seed(seed + 1)
+    return torch.randperm(n_atom, generator=gen).to(device)
+
+
 def oracle_fourier_encode(target: torch.Tensor) -> torch.Tensor:
     """[N, 3] canonical-frame coordinates in nm -> [N, TOKEN_DIM], frame-free.
 
@@ -204,6 +216,7 @@ class WorldParticleBridge(nn.Module):
         oracle_source: str = "",
         oracle_seed: int = 20261008,
         oracle_encoding: str = "linear",
+        oracle_shuffle: bool = False,
     ) -> None:
         super().__init__()
         if mode not in MODES:
@@ -215,6 +228,7 @@ class WorldParticleBridge(nn.Module):
         self.wp = None
         self.oracle_seed: Optional[int] = None
 
+        self.oracle_shuffle = bool(oracle_shuffle)
         self.oracle_encoding = str(oracle_encoding)
         if self.oracle_encoding not in ORACLE_ENCODINGS:
             raise ValueError(
@@ -311,6 +325,7 @@ class WorldParticleBridge(nn.Module):
             "oracle_source": windows.oracle_source(),
             "oracle_seed": self.oracle_seed,
             "oracle_encoding": self.oracle_encoding,
+            "oracle_shuffle": self.oracle_shuffle,
             "oracle_k_anchor": ORACLE_K_ANCHOR,
             "oracle_m_freq": ORACLE_M_FREQ,
             "oracle_lambda_nm": [ORACLE_LAMBDA_MAX_NM, ORACLE_LAMBDA_MIN_NM],
@@ -444,7 +459,16 @@ class WorldParticleBridge(nn.Module):
                 # off, so h has to leave here as float32.
                 with torch.autocast(device_type=position.device.type,
                                     enabled=False):
-                    return oracle_fourier_encode(target.float())
+                    h = oracle_fourier_encode(target.float())
+                    if self.oracle_shuffle:
+                        # After the encoding, not before: shuffling the
+                        # coordinates would change the distances and so change
+                        # the marginal distribution too, which is the one thing
+                        # this control has to keep.
+                        idx = oracle_shuffle_index(h.shape[0], self.oracle_seed,
+                                                   device=h.device)
+                        h = h[idx]
+                    return h
             # h = x_target_canonical @ P, before wp_layernorm -- which is where
             # the real path hands over too, so the two differ in what h is and
             # in nothing else downstream.

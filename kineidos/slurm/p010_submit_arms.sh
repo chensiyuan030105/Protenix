@@ -62,6 +62,10 @@ oracle-noaug|ORACLE|oracle||--wp.oracle_source target --wp.target_augmentation f
 # not optional -- D2 item 6.
 oracle-v2|ORACLE|oracle||--wp.oracle_source target --wp.oracle_encoding fourier_anchor
 oracle-v2-decoy|ORACLE|oracle||--wp.oracle_source decoy --wp.oracle_encoding fourier_anchor
+# readout.md 13.3: the decoy is not a null for a distance encoding (same
+# molecule, 82% of the effect).  This one keeps the signal and destroys only
+# the atom-to-geometry correspondence.
+oracle-v2-shuffle|ORACLE|oracle||--wp.oracle_source target --wp.oracle_encoding fourier_anchor --wp.oracle_shuffle true
 gamma-freeze-A|GAMMA|random||--wp.freeze_layernorm_until_step 2000
 gamma-freeze-B|GAMMA|random||--wp.freeze_layernorm_until_step 1000
 EOF
