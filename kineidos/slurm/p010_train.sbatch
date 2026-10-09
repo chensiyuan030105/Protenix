@@ -85,7 +85,14 @@ SEED="${SEED:-42}"
 # partition, so 1000 would mean losing up to half an arm to one preemption.
 # Four files of ~3.1 GB per arm, ~12 GB an arm; /mnt/xfs is at 97%, which is
 # why this is not smaller still.
-CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-500}"
+# 250, not 500.  SIGMA_GRID_INTERVAL is also 500, so with both at 500 the
+# first readout lands at step 499 and the first checkpoint at 500 -- the whole
+# stretch from launch to the first useful number had no resume point.  On
+# `background`, which preempts with no grace period, that stretch is both the
+# most valuable and the only unresumable one: two oracle-v2 arms were preempted
+# at steps 149 and 249 and restarted from zero.  Two extra 3.1 GB checkpoints
+# per 1000-step arm, against 2.5 TB free.
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-250}"
 # Eight rounds over 2000 steps.  oracle should show within 500 (section 6,
 # item 2) and gamma's half-life is 1156-2115 steps, so the curve needs points
 # at that scale rather than at P009's 500.

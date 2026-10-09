@@ -126,8 +126,18 @@ newest_run () {
   # init_basics appends, for read_heldout.py's reason: a plain prefix match
   # makes p009_zero swallow p009_zero_seed2, which would score the noise-floor
   # arm under the baseline's name.
-  ls -d "${RUNS}"/"$1"_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9] \
-    2>/dev/null | sort | tail -1
+  # `|| true` is load-bearing.  `ls` exits 2 when the glob matches nothing,
+  # `2>/dev/null` hides the message but not the status, and `pipefail` hands
+  # that 2 to the whole pipeline -- so `RUN_DIR="$(newest_run ...)"` killed the
+  # script under `set -e` with status 2 and no output at all, before the
+  # friendly "no run directory for ..." two lines below could ever print.
+  # That is what job 2150100 died of, and the cause was only a wrong arm
+  # prefix.  Third time this shape has cost a job (the others: `xargs -n1
+  # basename` on empty input, and a non-matching `ls` glob in the submit
+  # script).  **Under `set -euo pipefail`, "fail quietly then print something
+  # helpful" never reaches the helpful part.**
+  { ls -d "${RUNS}"/"$1"_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9] \
+      2>/dev/null || true; } | sort | tail -1
 }
 
 FAILED=""
